@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.openai/
+.env
+.env.*
+*.log
+*.xml
+*.nmap
+*.gnmap
+dist/nmap-studio-local.zip
