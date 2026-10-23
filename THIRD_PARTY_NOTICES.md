@@ -4,4 +4,4 @@ Nmap Studio is an independent interface, not an official Nmap product. Nmap exec
 
 The bundled script descriptions and CLI help in dist/catalog.js are derived from Nmap 7.99. The applicable upstream Nmap license is preserved in NMAP-LICENSE.txt. Upstream source: https://github.com/nmap/nmap.
 
-DM Sans and IBM Plex Mono are requested from Google Fonts; local fallback fonts work without the font service.
+The interface uses system fonts and does not load a remote font service.
