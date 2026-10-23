@@ -1,82 +1,611 @@
-"""Local-only Nmap Studio runner. Python 3.10+, no dependencies."""
-import json, os, pathlib, secrets, shutil, subprocess, sys, threading, uuid, webbrowser
-from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+"""Secure, local-only HTTP runner for Nmap Studio."""
+from __future__ import annotations
+
+import codecs
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+import pathlib
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+import webbrowser
+import xml.etree.ElementTree as ET
+from collections import OrderedDict, deque
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, urlsplit
+
+VERSION = "0.2.0"
 ROOT = pathlib.Path(__file__).resolve().parent
-TOKEN = secrets.token_urlsafe(32)
-JOBS = {}
-PORT = int(os.environ.get('NMAP_STUDIO_PORT', '8765'))
-def command(tool):
-    if tool not in ('nmap', 'ncat', 'nping', 'ndiff'): raise ValueError('Unknown tool')
-    if tool == 'ndiff':
-        base = pathlib.Path(shutil.which('nmap') or '').parent
-        if (base / 'ndiff.py').exists(): return [sys.executable, str(base / 'ndiff.py')]
-    p = shutil.which(tool)
-    if not p: raise ValueError(f'{tool} is not installed or not on PATH')
-    return [p]
-def run(job, tool, args):
+DATA_DIR = ROOT / ".nmap-studio"
+REPORT_DIR = DATA_DIR / "reports"
+LOG_DIR = DATA_DIR / "logs"
+LOG_FILE = LOG_DIR / "nmap-studio.log"
+DEFAULT_PORT = int(os.environ.get("NMAP_STUDIO_PORT", "8765"))
+MAX_BODY_BYTES = 128 * 1024
+MAX_ARGS = 128
+MAX_ARG_BYTES = 4096
+MAX_TOTAL_ARG_BYTES = 65536
+MAX_OUTPUT_BYTES = 2 * 1024 * 1024
+MAX_COMPLETED_JOBS = 20
+JOB_TTL_SECONDS = 24 * 60 * 60
+MAX_RUNNING_JOBS = 4
+MAX_XML_BYTES = 10 * 1024 * 1024
+MAX_XML_HOSTS = 2000
+MAX_XML_PORTS = 50000
+TOOLS = ("nmap", "ncat", "nping", "ndiff")
+COMMAND_OVERRIDES: dict[str, list[str]] = {}
+TOOL_CACHE: dict[str, dict] = {}
+TOOL_CACHE_TIME = 0.0
+TOOL_CACHE_LOCK = threading.Lock()
+
+PLAIN_SAFE_FLAGS = {
+    "nmap": {
+        "-sS", "-sT", "-sU", "-sA", "-sW", "-sM", "-sN", "-sF", "-sX",
+        "-sV", "-sC", "-O", "-Pn", "-n", "-R", "--traceroute", "--reason", "--open",
+        "-sL", "-sY", "-sZ", "-sO", "-PE", "-PS", "-PA", "-PU",
+        "-T0", "-T1", "-T2", "-T3", "-T4", "-T5", "-4", "-6", "-sn",
+    },
+    "ncat": {"-u", "--udp", "--ssl", "-v", "--verbose", "-z"},
+    "nping": {"--tcp-connect", "--udp", "--icmp", "-v"},
+    "ndiff": {"--xml", "-v"},
+}
+VALUE_SAFE_FLAGS = {
+    "nmap": {"-p", "--top-ports", "--exclude", "--max-retries", "--host-timeout"},
+    "ncat": {"-w", "--wait", "-i", "--idle-timeout"},
+    "nping": {"-c", "--count", "-p", "--dest-port", "--delay"},
+    "ndiff": set(),
+}
+OUTPUT_FLAGS = ("-oX", "-oA", "-oN", "-oG", "-oS")
+
+
+class ValidationError(ValueError):
+    """An error suitable for returning as a 400 response."""
+
+
+def configure_logging() -> logging.Logger:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("nmap-studio")
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(handler)
+    return logger
+
+
+LOGGER = configure_logging()
+
+
+def resolve_command(tool: str) -> list[str]:
+    if tool not in TOOLS:
+        raise ValidationError("Unknown tool")
+    if tool in COMMAND_OVERRIDES:
+        return list(COMMAND_OVERRIDES[tool])
+    if tool == "ndiff":
+        nmap_path = shutil.which("nmap")
+        if nmap_path:
+            candidate = pathlib.Path(nmap_path).parent / "ndiff.py"
+            if candidate.exists():
+                return [sys.executable, str(candidate)]
+    path = shutil.which(tool)
+    if not path:
+        raise ValidationError(f"{tool} is not installed or is not on PATH")
+    return [path]
+
+
+def validate_args(tool: str, args: object, safe_mode: object, confirm_advanced: object) -> list[str]:
+    if tool not in TOOLS:
+        raise ValidationError("Unknown tool")
+    if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+        raise ValidationError("args must be an array of strings")
+    if len(args) > MAX_ARGS:
+        raise ValidationError(f"Too many arguments; maximum is {MAX_ARGS}")
+    total = 0
+    for arg in args:
+        size = len(arg.encode("utf-8"))
+        if not arg or "\x00" in arg or size > MAX_ARG_BYTES:
+            raise ValidationError("An argument is empty, invalid, or too long")
+        total += size
+    if total > MAX_TOTAL_ARG_BYTES:
+        raise ValidationError("Command is too large")
+    if safe_mode is not False:
+        validate_safe_args(tool, args)
+    elif confirm_advanced is not True:
+        raise ValidationError("Advanced mode must be explicitly confirmed")
+    return args
+
+
+def validate_safe_args(tool: str, args: list[str]) -> None:
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            raise ValidationError("The -- separator requires Advanced mode")
+        if not arg.startswith("-") or arg == "-":
+            index += 1
+            continue
+        if arg in PLAIN_SAFE_FLAGS[tool]:
+            index += 1
+            continue
+        if arg in VALUE_SAFE_FLAGS[tool]:
+            if index + 1 >= len(args) or args[index + 1].startswith("-"):
+                raise ValidationError(f"{arg} requires a value")
+            index += 2
+            continue
+        if any(arg.startswith(flag + "=") for flag in VALUE_SAFE_FLAGS[tool]):
+            index += 1
+            continue
+        if tool == "nmap" and arg.startswith("-p") and len(arg) > 2:
+            index += 1
+            continue
+        raise ValidationError(f"{arg} requires Advanced mode")
+
+
+def parse_nmap_report(path: pathlib.Path) -> dict | None:
+    if not path.exists() or path.stat().st_size > MAX_XML_BYTES:
+        return None
+    header = path.read_bytes()[:4096].upper()
+    if b"<!DOCTYPE" in header and b"<!DOCTYPE NMAPRUN>" not in header:
+        raise ValidationError("Only the standard Nmap XML document type is accepted")
+    root = ET.parse(path).getroot()
+    hosts: list[dict] = []
+    port_count = 0
+    for host_element in root.findall("host"):
+        if len(hosts) >= MAX_XML_HOSTS:
+            break
+        address = host_element.find("address")
+        status = host_element.find("status")
+        hostname = host_element.find("hostnames/hostname")
+        ports: list[dict] = []
+        for port_element in host_element.findall("ports/port"):
+            if port_count >= MAX_XML_PORTS:
+                break
+            state = port_element.find("state")
+            service = port_element.find("service")
+            ports.append({
+                "port": port_element.get("portid", ""),
+                "protocol": port_element.get("protocol", ""),
+                "state": state.get("state", "") if state is not None else "",
+                "service": service.get("name", "") if service is not None else "",
+                "product": service.get("product", "") if service is not None else "",
+                "version": service.get("version", "") if service is not None else "",
+            })
+            port_count += 1
+        hosts.append({
+            "address": address.get("addr", "") if address is not None else "",
+            "hostname": hostname.get("name", "") if hostname is not None else "",
+            "state": status.get("state", "") if status is not None else "",
+            "ports": ports,
+        })
+    runstats = root.find("runstats/finished")
+    return {
+        "hosts": hosts,
+        "hostCount": len(hosts),
+        "portCount": port_count,
+        "summary": runstats.get("summary", "") if runstats is not None else "",
+    }
+
+
+class Job:
+    def __init__(self, tool: str, args: list[str], safe_mode: bool):
+        self.id = uuid.uuid4().hex
+        self.tool = tool
+        self.args = args
+        self.safe_mode = safe_mode
+        self.created = time.time()
+        self.finished: float | None = None
+        self.code: int | None = None
+        self.done = False
+        self.cancelled = False
+        self.report: dict | None = None
+        self.process: subprocess.Popen | None = None
+        self._chunks: deque[bytes] = deque()
+        self._output_bytes = 0
+        self._lock = threading.RLock()
+
+    def append(self, data: bytes) -> None:
+        if not data:
+            return
+        if len(data) > MAX_OUTPUT_BYTES:
+            data = data[-MAX_OUTPUT_BYTES:]
+        with self._lock:
+            self._chunks.append(data)
+            self._output_bytes += len(data)
+            while self._output_bytes > MAX_OUTPUT_BYTES and self._chunks:
+                overflow = self._output_bytes - MAX_OUTPUT_BYTES
+                first = self._chunks[0]
+                if len(first) <= overflow:
+                    self._chunks.popleft()
+                    self._output_bytes -= len(first)
+                else:
+                    self._chunks[0] = first[overflow:]
+                    self._output_bytes -= overflow
+
+    def set_process(self, process: subprocess.Popen) -> None:
+        with self._lock:
+            self.process = process
+
+    def finish(self, code: int, report: dict | None = None) -> None:
+        with self._lock:
+            self.code = code
+            self.report = report
+            self.done = True
+            self.finished = time.time()
+            self.process = None
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "id": self.id, "tool": self.tool, "args": self.args,
+                "safeMode": self.safe_mode, "created": self.created,
+                "finished": self.finished, "done": self.done,
+                "cancelled": self.cancelled, "code": self.code,
+                "output": b"".join(self._chunks).decode("utf-8", errors="replace"),
+                "report": self.report,
+            }
+
+
+class JobStore:
+    def __init__(self) -> None:
+        self._jobs: OrderedDict[str, Job] = OrderedDict()
+        self._lock = threading.RLock()
+
+    def add(self, job: Job) -> None:
+        with self._lock:
+            self._prune_locked()
+            running = sum(not existing.done for existing in self._jobs.values())
+            if running >= MAX_RUNNING_JOBS:
+                raise ValidationError(f"At most {MAX_RUNNING_JOBS} scans can run at once")
+            self._jobs[job.id] = job
+
+    def get(self, job_id: str) -> Job | None:
+        with self._lock:
+            self._prune_locked()
+            return self._jobs.get(job_id)
+
+    def running(self) -> list[Job]:
+        with self._lock:
+            return [job for job in self._jobs.values() if not job.done]
+
+    def _prune_locked(self) -> None:
+        now = time.time()
+        for job_id, job in list(self._jobs.items()):
+            if job.done and job.finished and now - job.finished > JOB_TTL_SECONDS:
+                self._jobs.pop(job_id, None)
+        completed = [job_id for job_id, job in self._jobs.items() if job.done]
+        while len(completed) > MAX_COMPLETED_JOBS:
+            self._jobs.pop(completed.pop(0), None)
+
+
+JOBS = JobStore()
+
+
+def terminate_process(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
     try:
-        p = subprocess.Popen(command(tool) + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.PIPE, cwd=ROOT, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-        job['process'] = p
-        if job.get('cancelled'): p.terminate()
-        while True:
-            b = p.stdout.read1(4096)
-            if not b: break
-            job['output'] = (job['output'] + b.decode('utf-8', errors='replace'))[-2000000:]
-        job['code'] = p.wait()
-    except Exception as e: job['output'] += str(e); job['code'] = -1
-    job['done'] = True
-class Handler(SimpleHTTPRequestHandler):
-    def __init__(self, *a, **kw): super().__init__(*a, directory=str(ROOT / 'dist'), **kw)
-    def log_message(self, *a): pass
-    def send_json(self, data, code=200):
-        body = json.dumps(data).encode(); self.send_response(code); self.send_header('Content-Type', 'application/json'); self.send_header('Cache-Control', 'no-store'); self.end_headers(); self.wfile.write(body)
-    def valid_host(self): return self.headers.get('Host') in (f'127.0.0.1:{PORT}', f'localhost:{PORT}')
-    def do_GET(self):
-        if not self.valid_host(): return self.send_json({'error':'Invalid host'},403)
-        if self.path == '/api/status':
-            tools = {}
-            for t in ('nmap','ncat','nping','ndiff'):
-                try: command(t); tools[t] = True
-                except ValueError: tools[t] = False
-            return self.send_json({'token':TOKEN, 'tools':tools})
-        if self.path.startswith('/api/jobs/'):
-            if self.headers.get('X-Studio-Token') != TOKEN: return self.send_json({'error':'Unauthorized'},403)
-            j = JOBS.get(self.path.split('/')[-1])
-            return self.send_json({k:v for k,v in j.items() if k != 'process'} if j else {'error':'Job not found'},200 if j else 404)
-        return super().do_GET()
-    def do_POST(self):
-        if not self.valid_host() or self.headers.get('X-Studio-Token') != TOKEN or self.headers.get('Origin') not in (None,f'http://127.0.0.1:{PORT}',f'http://localhost:{PORT}'):
-            return self.send_json({'error':'Unauthorized origin or token'},403)
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=5, check=False,
+            )
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=3)
+    except Exception:
         try:
-            size = int(self.headers.get('Content-Length','0'))
-            if size > 100000: raise ValueError('Request too large')
-            data = json.loads(self.rfile.read(size))
-            if self.path == '/api/run':
-                tool, args = data['tool'], data['args']; command(tool)
-                if not isinstance(args,list) or not all(isinstance(a,str) and '\0' not in a for a in args): raise ValueError('Arguments must be a string array')
-                if sum(not j['done'] for j in JOBS.values()) >= 4: raise ValueError('Stop a running job first (4 job limit)')
-                ident = uuid.uuid4().hex; job = {'id':ident,'tool':tool,'args':args,'output':'','done':False,'code':None}; JOBS[ident] = job
-                threading.Thread(target=run,args=(job,tool,args),daemon=True).start()
-                return self.send_json({'id':ident})
-            job = JOBS.get(data.get('id'))
-            if not job: raise ValueError('Job not found')
-            p = job.get('process')
-            if self.path == '/api/stop':
-                job['cancelled'] = True
-                if p and p.poll() is None: p.terminate()
-            elif self.path == '/api/input':
-                if not p or p.poll() is not None: raise ValueError('Process is not running')
-                if data.get('eof'): p.stdin.close()
-                else: p.stdin.write(data.get('text','').encode()); p.stdin.flush()
-            else: raise ValueError('Unknown endpoint')
-            self.send_json({'ok':True})
-        except Exception as e: self.send_json({'error':str(e)},400)
-if __name__ == '__main__':
-    server = ThreadingHTTPServer(('127.0.0.1',PORT),Handler)
-    print(f'Nmap Studio: http://127.0.0.1:{PORT}',flush=True)
-    if '--no-browser' not in sys.argv: webbrowser.open(f'http://127.0.0.1:{PORT}')
-    try: server.serve_forever()
+            if os.name == "nt":
+                process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+        except Exception:
+            LOGGER.exception("Unable to terminate process %s", process.pid)
+
+
+def run_job(job: Job) -> None:
+    report_path = REPORT_DIR / f"{job.id}.xml"
+    args = list(job.args)
+    if job.tool == "nmap" and not any(
+        arg == flag or arg.startswith(flag) for arg in args for flag in OUTPUT_FLAGS
+    ):
+        args.extend(["-oX", str(report_path)])
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if os.name == "nt":
+        creation_flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    try:
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        process = subprocess.Popen(
+            resolve_command(job.tool) + args,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.PIPE,
+            cwd=ROOT, creationflags=creation_flags, start_new_session=os.name != "nt",
+        )
+        job.set_process(process)
+        if job.cancelled:
+            terminate_process(process)
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        assert process.stdout is not None
+        reader = getattr(process.stdout, "read1", process.stdout.read)
+        while True:
+            chunk = reader(4096)
+            if not chunk:
+                break
+            job.append(decoder.decode(chunk).encode("utf-8"))
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            job.append(tail.encode("utf-8"))
+        code = process.wait()
+        report = parse_nmap_report(report_path) if job.tool == "nmap" and code == 0 and not job.cancelled else None
+        process.stdout.close()
+        if process.stdin and not process.stdin.closed:
+            process.stdin.close()
+        job.finish(code, report)
+        LOGGER.info("job=%s tool=%s code=%s cancelled=%s", job.id, job.tool, code, job.cancelled)
+    except Exception as exc:
+        LOGGER.exception("job=%s failed", job.id)
+        job.append((str(exc) + "\n").encode("utf-8"))
+        job.finish(-1)
+
+
+def stop_job(job: Job) -> None:
+    with job._lock:
+        job.cancelled = True
+        process = job.process
+    if process is not None:
+        terminate_process(process)
+
+
+def tool_status(tool: str) -> dict:
+    try:
+        command = resolve_command(tool)
+        completed = subprocess.run(command + ["--version"], capture_output=True, text=True, timeout=4, cwd=ROOT)
+        first_line = (completed.stdout or completed.stderr).strip().splitlines()
+        return {"installed": True, "path": command[-1], "version": first_line[0] if first_line else "Installed"}
+    except Exception as exc:
+        return {"installed": False, "path": "", "version": str(exc)}
+
+
+def all_tool_status() -> dict[str, dict]:
+    global TOOL_CACHE, TOOL_CACHE_TIME
+    with TOOL_CACHE_LOCK:
+        if time.time() - TOOL_CACHE_TIME > 30:
+            TOOL_CACHE = {tool: tool_status(tool) for tool in TOOLS}
+            TOOL_CACHE_TIME = time.time()
+        return dict(TOOL_CACHE)
+
+
+def discover_scripts() -> list[str]:
+    candidates: list[pathlib.Path] = []
+    nmap_path = shutil.which("nmap")
+    if nmap_path:
+        candidates.append(pathlib.Path(nmap_path).parent / "scripts")
+    candidates.extend([
+        pathlib.Path("/usr/share/nmap/scripts"),
+        pathlib.Path("/usr/local/share/nmap/scripts"),
+        pathlib.Path(os.environ.get("ProgramFiles(x86)", "")) / "Nmap" / "scripts",
+        pathlib.Path(os.environ.get("ProgramFiles", "")) / "Nmap" / "scripts",
+    ])
+    scripts: set[str] = set()
+    for directory in candidates:
+        if directory.is_dir():
+            scripts.update(item.stem for item in directory.glob("*.nse"))
+    return sorted(scripts)[:5000]
+
+
+def log_tail(max_bytes: int = 200_000) -> str:
+    if not LOG_FILE.exists():
+        return "No diagnostics have been recorded yet."
+    with LOG_FILE.open("rb") as handle:
+        handle.seek(max(0, LOG_FILE.stat().st_size - max_bytes))
+        return handle.read().decode("utf-8", errors="replace")
+
+
+class StudioServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address: tuple[str, int]):
+        self.token = secrets.token_urlsafe(32)
+        self.shutdown_requested = False
+        super().__init__(address, Handler)
+
+    def handle_error(self, request, client_address) -> None:
+        LOGGER.debug("Client disconnected during response: %s", client_address, exc_info=True)
+
+
+class Handler(SimpleHTTPRequestHandler):
+    server: StudioServer
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(ROOT / "dist"), **kwargs)
+
+    def log_message(self, fmt: str, *args) -> None:
+        LOGGER.info("http %s", fmt % args)
+
+    def end_headers(self) -> None:
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()")
+        super().end_headers()
+
+    def valid_host(self) -> bool:
+        host = self.headers.get("Host", "").lower()
+        port = self.server.server_address[1]
+        return host in {f"127.0.0.1:{port}", f"localhost:{port}"}
+
+    def valid_origin(self) -> bool:
+        origin = self.headers.get("Origin", "").lower()
+        port = self.server.server_address[1]
+        return origin in {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+
+    def authorized(self) -> bool:
+        return secrets.compare_digest(self.headers.get("X-Nmap-Studio-Token", ""), self.server.token)
+
+    def send_json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_text(self, status: int, payload: str, content_type: str = "text/plain; charset=utf-8") -> None:
+        body = payload.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def read_json(self) -> dict:
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise ValidationError("Content-Type must be application/json")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValidationError("Invalid Content-Length") from exc
+        if length <= 0 or length > MAX_BODY_BYTES:
+            raise ValidationError("Request body is empty or too large")
+        try:
+            value = json.loads(self.rfile.read(length))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValidationError("Invalid JSON") from exc
+        if not isinstance(value, dict):
+            raise ValidationError("JSON body must be an object")
+        return value
+
+    def do_GET(self) -> None:
+        if not self.valid_host():
+            self.send_json(403, {"error": "Invalid Host header"})
+            return
+        path = urlsplit(self.path).path
+        if path == "/api/status":
+            tools = all_tool_status()
+            self.send_json(200, {"ok": True, "version": VERSION, "token": self.server.token, "tools": tools, "safeModeDefault": True})
+            return
+        if path.startswith("/api/jobs/"):
+            if not self.authorized():
+                self.send_json(403, {"error": "Invalid session token"})
+                return
+            job = JOBS.get(path.rsplit("/", 1)[-1])
+            self.send_json(200, job.snapshot()) if job else self.send_json(404, {"error": "Job not found"})
+            return
+        if path.startswith("/api/help/"):
+            if not self.authorized():
+                self.send_json(403, {"error": "Invalid session token"})
+                return
+            tool = unquote(path.rsplit("/", 1)[-1])
+            try:
+                completed = subprocess.run(resolve_command(tool) + ["--help"], capture_output=True, text=True, timeout=8, cwd=ROOT)
+                self.send_text(200, (completed.stdout or completed.stderr)[:500_000])
+            except Exception as exc:
+                self.send_json(400, {"error": str(exc)})
+            return
+        if path == "/api/scripts":
+            if not self.authorized():
+                self.send_json(403, {"error": "Invalid session token"})
+                return
+            self.send_json(200, {"scripts": discover_scripts()})
+            return
+        if path == "/api/diagnostics":
+            if not self.authorized():
+                self.send_json(403, {"error": "Invalid session token"})
+                return
+            self.send_text(200, log_tail())
+            return
+        super().do_GET()
+
+    def do_POST(self) -> None:
+        if not self.valid_host() or not self.valid_origin() or not self.authorized():
+            self.send_json(403, {"error": "Request origin or session token was rejected"})
+            return
+        try:
+            body = self.read_json()
+            path = urlsplit(self.path).path
+            if path == "/api/run":
+                tool = body.get("tool")
+                safe_mode = body.get("safeMode", True)
+                args = validate_args(tool, body.get("args"), safe_mode, body.get("confirmAdvanced"))
+                job = Job(tool, args, safe_mode is not False)
+                JOBS.add(job)
+                threading.Thread(target=run_job, args=(job,), daemon=True, name=f"job-{job.id[:8]}").start()
+                self.send_json(202, {"id": job.id})
+                return
+            if path == "/api/stop":
+                job_id = body.get("id")
+                if not isinstance(job_id, str):
+                    raise ValidationError("id is required")
+                job = JOBS.get(job_id)
+                if not job:
+                    self.send_json(404, {"error": "Job not found"})
+                    return
+                stop_job(job)
+                self.send_json(200, {"ok": True})
+                return
+            if path == "/api/input":
+                job = JOBS.get(body.get("id", ""))
+                value = body.get("data")
+                if not job or not isinstance(value, str) or len(value.encode("utf-8")) > 65536:
+                    raise ValidationError("Invalid job or input")
+                with job._lock:
+                    if not job.process or not job.process.stdin:
+                        raise ValidationError("The process is not accepting input")
+                    if body.get("eof") is True:
+                        job.process.stdin.close()
+                    else:
+                        job.process.stdin.write(value.encode("utf-8"))
+                        job.process.stdin.flush()
+                self.send_json(200, {"ok": True})
+                return
+            if path == "/api/shutdown":
+                self.server.shutdown_requested = True
+                self.send_json(200, {"ok": True})
+                def shutdown_runner() -> None:
+                    for running_job in JOBS.running():
+                        stop_job(running_job)
+                    self.server.shutdown()
+                threading.Thread(target=shutdown_runner, daemon=True).start()
+                return
+            self.send_json(404, {"error": "Not found"})
+        except ValidationError as exc:
+            self.send_json(400, {"error": str(exc)})
+        except Exception:
+            LOGGER.exception("Unhandled request failure")
+            self.send_json(500, {"error": "Internal server error; download diagnostics for details"})
+
+
+def create_server(port: int = DEFAULT_PORT) -> StudioServer:
+    return StudioServer(("127.0.0.1", port))
+
+
+def main() -> None:
+    no_browser = "--no-browser" in sys.argv
+    server = create_server(DEFAULT_PORT)
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    LOGGER.info("Nmap Studio %s starting at %s", VERSION, url)
+    print(f"Nmap Studio {VERSION} is running at {url}")
+    if not no_browser:
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
     finally:
-        for job in JOBS.values():
-            p=job.get('process')
-            if p and p.poll() is None: p.terminate()
+        for running_job in JOBS.running():
+            stop_job(running_job)
+        server.server_close()
+        LOGGER.info("Nmap Studio stopped")
+
+
+if __name__ == "__main__":
+    main()

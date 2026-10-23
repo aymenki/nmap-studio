@@ -1,34 +1,75 @@
 # Nmap Studio
 
-**Prototype release:** local-only execution. Do not expose this runner on a public interface. Advanced arguments run with your account permissions. This version has not completed the proposed release-hardening review.
+Nmap Studio is a local browser interface for Nmap, Ncat, Nping, and Ndiff. It turns common network tasks into forms, shows live output, and converts Nmap XML into a host and service inventory.
 
-A local browser interface for Nmap, Ncat, Nping, and Ndiff. Includes scan presets, live output and process input, cancellation, browser-local profiles/history, XML host/port inspection, 612 indexed NSE scripts, and CLI help captured from Nmap 7.99.
+![Nmap Studio scan builder](docs/screenshot.png)
 
-## Run
+> Use Nmap Studio only on systems you own or have explicit permission to test.
 
-Install Python 3.10+ and the official Nmap suite (https://nmap.org/download.html). Put the Nmap executables on PATH. From this folder run:
+## Highlights
 
-```powershell
+- Run all four Nmap suite tools inside the UI.
+- Normalize website URLs to hostnames before scanning.
+- Stream output, send process input, cancel a process tree, and stop the runner.
+- Parse every completed Nmap scan into structured results automatically.
+- Discover the installed Nmap version, NSE scripts, executable paths, and CLI help.
+- Start in Safe mode with a server-side option allowlist. Advanced mode requires explicit confirmation.
+- Save reusable profiles and import/export them as JSON.
+- Keep scan history off by default; enable it locally or clear it at any time.
+- Download rotating diagnostic logs from Settings.
+- Use a dependency-free Python server on Windows, macOS, or Linux.
+
+## Install and run
+
+Requirements:
+
+- Python 3.10 or newer
+- The [official Nmap suite](https://nmap.org/download.html), with its executables on PATH
+
+Clone or download this repository, then run:
+
+~~~bash
 python server.py
-```
+~~~
 
-On Windows, double-click start.cmd to launch the runner in the background and open the UI. Closing the browser does not stop that background runner; it remains available until its Python process exits or Windows restarts. The page automatically reconnects after a runner restart.
+The app opens at http://127.0.0.1:8765. Keep the terminal open and press Ctrl+C to stop it. On Windows, double-click start.cmd; use stop.cmd or Settings → Stop local runner when finished.
 
-When using python server.py directly, the UI opens at http://127.0.0.1:8765. Keep the terminal running. Press Ctrl+C to stop the server and its jobs. Set NMAP_STUDIO_PORT to use another port. No Python packages are required.
+Set NMAP_STUDIO_PORT before starting if port 8765 is already in use.
 
-The hosted site is a command builder and report viewer. It cannot execute raw network tools; download and run this local app for execution. It does not connect remotely to your local runner.
+## Execution modes
 
-## Features and scope
+Safe mode accepts common scan, discovery, timing, service, OS, connection, and probe options. It rejects custom scripts, script arguments, listeners, output path overrides, and uncommon raw options.
 
-- Common Nmap options have form controls. The Advanced JSON argument array accepts all CLI arguments supported by the installed tools, including options without dedicated controls. The UI launches argument lists directly, without a command shell.
-- The Script library adds script names to the builder; scripts execute from your Nmap installation. The bundled catalog is a snapshot of 612 scripts, not an auto-updating feed.
-- For XML reports add ["-oX", "C:/scans/report.xml"] under Advanced. Import the resulting report in Scan results. That viewer shows host state and port/service inventory; full NSE and OS details remain in the exported report/output.
-- Ncat supports stdin messages and EOF from the output panel. Advanced arguments cover proxy, TLS, listener, and other options.
-- Nping supports common protocols plus all other CLI arguments. Raw probes and some Nmap scan modes require administrator/root privileges and appropriate capture drivers. Start the runner with those privileges only when needed.
-- Ndiff uses two local XML paths. On Windows the runner uses the installed ndiff.py with Python; platforms with an ndiff executable use PATH.
-- Profiles and the last 20 completed outputs persist in this browser. They may contain sensitive network data. Output is capped at the most recent 2 MB per process. Jobs do not resume after a server restart.
-- This is an independent interface, not an official Nmap product or a complete replacement for Zenmap's topology and every specialized visualization. All four command-line tools are accessible, while uncommon options use the advanced editor.
+Turn off Safe mode to use the complete installed command line. The UI asks for confirmation and the server also requires an explicit advanced-mode flag. Commands are created as argument arrays and launched without a shell, so shell operators and expansion are never evaluated.
 
-The server binds only to loopback, checks Host and Origin on mutations, requires a per-session token, and does not enable CORS. Keep it local. Commands run with your operating-system account's permissions and may write files specified in arguments. Use only on authorized systems.
+Raw packet scans, OS detection, and some probe modes may need administrator or root privileges. Start with ordinary user permissions and elevate only for a task that requires it.
 
-Reference: https://github.com/nmap/nmap and https://nmap.org/book/man.html
+## Privacy and data
+
+The runner binds only to loopback. It validates Host and Origin, requires a random session token, sends no CORS headers, applies a strict Content Security Policy, limits requests and output, and retains at most 20 completed jobs for 24 hours in memory.
+
+Nmap Studio does not send scan data to a hosted service. Browser history persistence is disabled by default. Profiles and enabled history are stored in the browser. Reports and rotating diagnostic logs are stored under .nmap-studio/, which Git ignores.
+
+Imported XML is limited to 10 MB, 2,000 hosts, and 50,000 ports. Automatic report parsing rejects XML document types.
+
+## Development
+
+Run the checks with:
+
+~~~bash
+python -m unittest discover -s tests -v
+python -m py_compile server.py launch.py
+node --check dist/app.js
+~~~
+
+Build the release archive and checksum with:
+
+~~~bash
+python scripts/build_release.py
+~~~
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and [SECURITY.md](SECURITY.md) for private vulnerability reporting.
+
+## Project scope
+
+Nmap Studio is an independent interface and is not an official Nmap project. Nmap and its related tools remain subject to their own license; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and [NMAP-LICENSE.txt](NMAP-LICENSE.txt). Nmap Studio's original code is released under the [MIT License](LICENSE).

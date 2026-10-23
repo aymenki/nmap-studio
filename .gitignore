@@ -1,5 +1,8 @@
+.nmap-studio/
 __pycache__/
-*.pyc
+*.py[cod]
+release/
+.DS_Store
 .openai/
 .env
 .env.*
