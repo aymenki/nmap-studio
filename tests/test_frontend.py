@@ -18,6 +18,11 @@ class FrontendTests(unittest.TestCase):
                       "/api/workspace/assets", "/api/workspace/findings", "/api/workspace/schedule", "/api/workspace/scope", "/api/enrichment/refresh", "sarif"):
             self.assertIn(value, app)
 
+    def test_initial_workspace_page_waits_for_session_token(self):
+        app = (ROOT / "dist" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("connectRunner().finally(() => show(initialPage))", app)
+        self.assertNotIn("show(initialPage);\nwindow.addEventListener", app)
+
 
 if __name__ == "__main__":
     unittest.main()

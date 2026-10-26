@@ -2,6 +2,16 @@
 
 All notable changes are documented here.
 
+## Unreleased
+
+### Changed
+
+- Refreshed the product demo to show the v0.4 asset, finding, monitoring, governance, and integration workflows
+
+### Fixed
+
+- Direct links to workspace pages now wait for the local session token before requesting protected data
+
 ## 0.4.0 — 2026-10-26
 
 ### Added

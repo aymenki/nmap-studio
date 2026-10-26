@@ -922,11 +922,10 @@ async function connectRunner() {
 }
 
 const initialPage = Object.hasOwn(names, location.hash.slice(1)) ? location.hash.slice(1) : "nmap";
-show(initialPage);
 window.addEventListener("hashchange", () => {
   const page = location.hash.slice(1);
   if (Object.hasOwn(names, page) && page !== current) show(page);
 });
-connectRunner();
+connectRunner().finally(() => show(initialPage));
 setInterval(connectRunner, 5000);
 setInterval(syncJobs, 2000);
