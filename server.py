@@ -7,6 +7,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 import pathlib
+import re
 import secrets
 import shutil
 import signal
@@ -21,7 +22,7 @@ from collections import OrderedDict, deque
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 ROOT = pathlib.Path(__file__).resolve().parent
 DATA_DIR = ROOT / ".nmap-studio"
 REPORT_DIR = DATA_DIR / "reports"
@@ -35,7 +36,8 @@ MAX_TOTAL_ARG_BYTES = 65536
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_COMPLETED_JOBS = 20
 JOB_TTL_SECONDS = 24 * 60 * 60
-MAX_RUNNING_JOBS = 4
+MAX_RUNNING_JOBS = 2
+MAX_QUEUED_JOBS = 32
 MAX_XML_BYTES = 10 * 1024 * 1024
 MAX_XML_HOSTS = 2000
 MAX_XML_PORTS = 50000
@@ -44,6 +46,10 @@ COMMAND_OVERRIDES: dict[str, list[str]] = {}
 TOOL_CACHE: dict[str, dict] = {}
 TOOL_CACHE_TIME = 0.0
 TOOL_CACHE_LOCK = threading.Lock()
+SCRIPT_CACHE: list[dict] = []
+SCRIPT_CACHE_TIME = 0.0
+SCRIPT_CACHE_LOCK = threading.Lock()
+RISKY_NSE_CATEGORIES = {"auth", "brute", "dos", "exploit", "external", "fuzzer", "intrusive", "malware", "vuln"}
 
 PLAIN_SAFE_FLAGS = {
     "nmap": {
@@ -134,6 +140,20 @@ def validate_safe_args(tool: str, args: list[str]) -> None:
         if arg in PLAIN_SAFE_FLAGS[tool]:
             index += 1
             continue
+        if tool == "nmap" and arg == "--script":
+            if index + 1 >= len(args):
+                raise ValidationError("--script requires a value")
+            validate_safe_scripts(args[index + 1])
+            index += 2
+            continue
+        if tool == "nmap" and arg == "--script-args":
+            if index + 1 >= len(args) or not re.fullmatch(
+                r"[A-Za-z0-9_.-]+=[A-Za-z0-9_./:@+ -]+(?:,[A-Za-z0-9_.-]+=[A-Za-z0-9_./:@+ -]+)*",
+                args[index + 1],
+            ):
+                raise ValidationError("Complex NSE arguments require Advanced mode")
+            index += 2
+            continue
         if arg in VALUE_SAFE_FLAGS[tool]:
             if index + 1 >= len(args) or args[index + 1].startswith("-"):
                 raise ValidationError(f"{arg} requires a value")
@@ -146,6 +166,19 @@ def validate_safe_args(tool: str, args: list[str]) -> None:
             index += 1
             continue
         raise ValidationError(f"{arg} requires Advanced mode")
+
+
+def validate_safe_scripts(value: str) -> None:
+    names = [name.strip() for name in value.split(",") if name.strip()]
+    if not names or any(not re.fullmatch(r"[A-Za-z0-9_.-]+", name) for name in names):
+        raise ValidationError("Safe mode accepts exact installed NSE script names only")
+    index = {item["name"]: item for item in discover_scripts()}
+    unavailable = [name for name in names if name not in index]
+    risky = [name for name in names if index.get(name, {}).get("risk") == "advanced"]
+    if unavailable:
+        raise ValidationError("Unknown NSE script: " + ", ".join(unavailable[:5]))
+    if risky:
+        raise ValidationError("These NSE scripts require Advanced mode: " + ", ".join(risky[:5]))
 
 
 def parse_nmap_report(path: pathlib.Path) -> dict | None:
@@ -194,16 +227,22 @@ def parse_nmap_report(path: pathlib.Path) -> dict | None:
 
 
 class Job:
-    def __init__(self, tool: str, args: list[str], safe_mode: bool):
+    def __init__(self, tool: str, args: list[str], safe_mode: bool, name: str = "", project: str = ""):
         self.id = uuid.uuid4().hex
         self.tool = tool
         self.args = args
         self.safe_mode = safe_mode
+        self.name = name or f"{tool} scan"
+        self.project = project or "Default"
         self.created = time.time()
+        self.started: float | None = None
         self.finished: float | None = None
         self.code: int | None = None
         self.done = False
         self.cancelled = False
+        self.state = "queued"
+        self.stage = "Waiting in queue"
+        self.progress = 0
         self.report: dict | None = None
         self.process: subprocess.Popen | None = None
         self._chunks: deque[bytes] = deque()
@@ -227,10 +266,25 @@ class Job:
                 else:
                     self._chunks[0] = first[overflow:]
                     self._output_bytes -= overflow
+            text = data.decode("utf-8", errors="ignore").lower()
+            if "nse:" in text or "script scan" in text:
+                self.stage, self.progress = "Running NSE scripts", max(self.progress, 82)
+            elif "service scan" in text or "service detection" in text:
+                self.stage, self.progress = "Detecting services", max(self.progress, 68)
+            elif "syn stealth scan" in text or "connect scan" in text or "udp scan" in text:
+                self.stage, self.progress = "Scanning ports", max(self.progress, 42)
+            elif "ping scan" in text or "host discovery" in text:
+                self.stage, self.progress = "Discovering hosts", max(self.progress, 20)
+            elif "starting nmap" in text:
+                self.stage, self.progress = "Starting Nmap", max(self.progress, 10)
 
     def set_process(self, process: subprocess.Popen) -> None:
         with self._lock:
             self.process = process
+            self.state = "running"
+            self.stage = "Running"
+            self.progress = max(self.progress, 5)
+            self.started = self.started or time.time()
 
     def finish(self, code: int, report: dict | None = None) -> None:
         with self._lock:
@@ -239,17 +293,36 @@ class Job:
             self.done = True
             self.finished = time.time()
             self.process = None
+            self.progress = 100
+            if self.cancelled:
+                self.state, self.stage = "cancelled", "Cancelled"
+            elif code == 0:
+                self.state, self.stage = "completed", "Completed"
+            else:
+                self.state, self.stage = "failed", "Failed"
 
-    def snapshot(self) -> dict:
+    def snapshot(self, queue_position: int | None = None, include_output: bool = True) -> dict:
         with self._lock:
-            return {
+            now = self.finished or time.time()
+            result = {
                 "id": self.id, "tool": self.tool, "args": self.args,
+                "name": self.name, "project": self.project,
                 "safeMode": self.safe_mode, "created": self.created,
-                "finished": self.finished, "done": self.done,
+                "started": self.started, "finished": self.finished, "done": self.done,
                 "cancelled": self.cancelled, "code": self.code,
-                "output": b"".join(self._chunks).decode("utf-8", errors="replace"),
-                "report": self.report,
+                "state": self.state, "stage": self.stage, "progress": self.progress,
+                "queuePosition": queue_position,
+                "elapsed": max(0, now - (self.started or self.created)),
+                "reportSummary": {
+                    "hostCount": self.report.get("hostCount", 0),
+                    "portCount": self.report.get("portCount", 0),
+                    "summary": self.report.get("summary", ""),
+                } if self.report else None,
             }
+            if include_output:
+                result["output"] = b"".join(self._chunks).decode("utf-8", errors="replace")
+                result["report"] = self.report
+            return result
 
 
 class JobStore:
@@ -260,10 +333,11 @@ class JobStore:
     def add(self, job: Job) -> None:
         with self._lock:
             self._prune_locked()
-            running = sum(not existing.done for existing in self._jobs.values())
-            if running >= MAX_RUNNING_JOBS:
-                raise ValidationError(f"At most {MAX_RUNNING_JOBS} scans can run at once")
+            pending = sum(not existing.done for existing in self._jobs.values())
+            if pending >= MAX_RUNNING_JOBS + MAX_QUEUED_JOBS:
+                raise ValidationError("The scan queue is full")
             self._jobs[job.id] = job
+            self._dispatch_locked()
 
     def get(self, job_id: str) -> Job | None:
         with self._lock:
@@ -272,7 +346,51 @@ class JobStore:
 
     def running(self) -> list[Job]:
         with self._lock:
+            return [job for job in self._jobs.values() if job.state == "running"]
+
+    def active(self) -> list[Job]:
+        with self._lock:
             return [job for job in self._jobs.values() if not job.done]
+
+    def list(self) -> list[dict]:
+        with self._lock:
+            self._prune_locked()
+            queued = [job.id for job in self._jobs.values() if job.state == "queued"]
+            return [
+                job.snapshot(
+                    queued.index(job.id) + 1 if job.id in queued else None,
+                    include_output=False,
+                )
+                for job in reversed(self._jobs.values())
+            ]
+
+    def finished(self, job: Job) -> None:
+        with self._lock:
+            self._dispatch_locked()
+
+    def cancel(self, job: Job) -> None:
+        with self._lock:
+            if job.state == "queued":
+                job.cancelled = True
+                job.finish(-1)
+                self._dispatch_locked()
+                return
+        stop_job(job)
+
+    def _dispatch_locked(self) -> None:
+        running = sum(job.state == "running" for job in self._jobs.values())
+        for job in self._jobs.values():
+            if running >= MAX_RUNNING_JOBS:
+                break
+            if job.state == "queued" and not job.done:
+                job.state = "running"
+                job.stage = "Starting"
+                job.progress = 2
+                job.started = time.time()
+                threading.Thread(
+                    target=run_job, args=(job,), daemon=True, name=f"job-{job.id[:8]}"
+                ).start()
+                running += 1
 
     def _prune_locked(self) -> None:
         now = time.time()
@@ -352,6 +470,8 @@ def run_job(job: Job) -> None:
         LOGGER.exception("job=%s failed", job.id)
         job.append((str(exc) + "\n").encode("utf-8"))
         job.finish(-1)
+    finally:
+        JOBS.finished(job)
 
 
 def stop_job(job: Job) -> None:
@@ -381,7 +501,22 @@ def all_tool_status() -> dict[str, dict]:
         return dict(TOOL_CACHE)
 
 
-def discover_scripts() -> list[str]:
+def script_metadata(path: pathlib.Path) -> dict:
+    try:
+        source = path.read_text(encoding="utf-8", errors="ignore")[:24_000]
+    except OSError:
+        source = ""
+    match = re.search(r"categories\s*=\s*\{([^}]*)\}", source, re.IGNORECASE | re.DOTALL)
+    categories = sorted(set(re.findall(r'["\']([A-Za-z0-9_-]+)["\']', match.group(1)))) if match else []
+    risk = "advanced" if RISKY_NSE_CATEGORIES.intersection(category.lower() for category in categories) else "safe"
+    return {"name": path.stem, "categories": categories, "risk": risk}
+
+
+def discover_scripts() -> list[dict]:
+    global SCRIPT_CACHE, SCRIPT_CACHE_TIME
+    with SCRIPT_CACHE_LOCK:
+        if SCRIPT_CACHE and time.time() - SCRIPT_CACHE_TIME < 60:
+            return list(SCRIPT_CACHE)
     candidates: list[pathlib.Path] = []
     nmap_path = shutil.which("nmap")
     if nmap_path:
@@ -392,11 +527,14 @@ def discover_scripts() -> list[str]:
         pathlib.Path(os.environ.get("ProgramFiles(x86)", "")) / "Nmap" / "scripts",
         pathlib.Path(os.environ.get("ProgramFiles", "")) / "Nmap" / "scripts",
     ])
-    scripts: set[str] = set()
+    scripts: dict[str, dict] = {}
     for directory in candidates:
         if directory.is_dir():
-            scripts.update(item.stem for item in directory.glob("*.nse"))
-    return sorted(scripts)[:5000]
+            for item in directory.glob("*.nse"):
+                scripts.setdefault(item.stem, script_metadata(item))
+    SCRIPT_CACHE = [scripts[name] for name in sorted(scripts)[:5000]]
+    SCRIPT_CACHE_TIME = time.time()
+    return list(SCRIPT_CACHE)
 
 
 def log_tail(max_bytes: int = 200_000) -> str:
@@ -493,6 +631,12 @@ class Handler(SimpleHTTPRequestHandler):
             tools = all_tool_status()
             self.send_json(200, {"ok": True, "version": VERSION, "token": self.server.token, "tools": tools, "safeModeDefault": True})
             return
+        if path == "/api/jobs":
+            if not self.authorized():
+                self.send_json(403, {"error": "Invalid session token"})
+                return
+            self.send_json(200, {"jobs": JOBS.list()})
+            return
         if path.startswith("/api/jobs/"):
             if not self.authorized():
                 self.send_json(403, {"error": "Invalid session token"})
@@ -536,10 +680,15 @@ class Handler(SimpleHTTPRequestHandler):
                 tool = body.get("tool")
                 safe_mode = body.get("safeMode", True)
                 args = validate_args(tool, body.get("args"), safe_mode, body.get("confirmAdvanced"))
-                job = Job(tool, args, safe_mode is not False)
+                name = body.get("name", "")
+                project = body.get("project", "")
+                if not isinstance(name, str) or len(name.strip()) > 80:
+                    raise ValidationError("Scan name must be 80 characters or fewer")
+                if not isinstance(project, str) or len(project.strip()) > 80:
+                    raise ValidationError("Project name must be 80 characters or fewer")
+                job = Job(tool, args, safe_mode is not False, name.strip(), project.strip())
                 JOBS.add(job)
-                threading.Thread(target=run_job, args=(job,), daemon=True, name=f"job-{job.id[:8]}").start()
-                self.send_json(202, {"id": job.id})
+                self.send_json(202, {"id": job.id, "state": job.state})
                 return
             if path == "/api/stop":
                 job_id = body.get("id")
@@ -549,7 +698,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if not job:
                     self.send_json(404, {"error": "Job not found"})
                     return
-                stop_job(job)
+                JOBS.cancel(job)
                 self.send_json(200, {"ok": True})
                 return
             if path == "/api/input":
@@ -571,8 +720,8 @@ class Handler(SimpleHTTPRequestHandler):
                 self.server.shutdown_requested = True
                 self.send_json(200, {"ok": True})
                 def shutdown_runner() -> None:
-                    for running_job in JOBS.running():
-                        stop_job(running_job)
+                    for active_job in JOBS.active():
+                        JOBS.cancel(active_job)
                     self.server.shutdown()
                 threading.Thread(target=shutdown_runner, daemon=True).start()
                 return
@@ -601,8 +750,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        for running_job in JOBS.running():
-            stop_job(running_job)
+        for active_job in JOBS.active():
+            JOBS.cancel(active_job)
         server.server_close()
         LOGGER.info("Nmap Studio stopped")
 

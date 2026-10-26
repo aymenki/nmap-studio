@@ -14,7 +14,7 @@ class FrontendTests(unittest.TestCase):
 
     def test_security_controls_are_exposed(self):
         app = (ROOT / "dist" / "app.js").read_text(encoding="utf-8")
-        for value in ("safeMode", "persistHistory", "/api/shutdown", "/api/diagnostics"):
+        for value in ("safeMode", "persistHistory", "/api/shutdown", "/api/diagnostics", "/api/jobs", "compareReports", "rowsToCSV", "riskLabel"):
             self.assertIn(value, app)
 
 

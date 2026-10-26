@@ -6,11 +6,12 @@ import pathlib
 import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 OUTPUT_DIR = ROOT / "release"
 ARCHIVE = OUTPUT_DIR / f"nmap-studio-v{VERSION}.zip"
 INCLUDE = [
     "dist",
+    "docs",
     "server.py",
     "launch.py",
     "start.cmd",
@@ -39,7 +40,7 @@ def main():
     with zipfile.ZipFile(ARCHIVE, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for path in files():
             info = zipfile.ZipInfo.from_file(path, path.relative_to(ROOT).as_posix())
-            info.date_time = (2026, 10, 23, 0, 0, 0)
+            info.date_time = (2026, 10, 26, 0, 0, 0)
             info.create_system = 3
             info.external_attr = 0o100644 << 16
             archive.writestr(info, path.read_bytes(), compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)

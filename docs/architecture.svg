@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560" role="img" aria-labelledby="title desc">
+  <title id="title">Nmap Studio architecture</title>
+  <desc id="desc">A local browser connects through a protected loopback API to validation, a bounded queue, Nmap suite processes, and local in-memory results.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#07111f"/><stop offset="1" stop-color="#111f34"/></linearGradient>
+    <linearGradient id="cyan" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#52e5c4"/><stop offset="1" stop-color="#48a7ff"/></linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#000" flood-opacity=".25"/></filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#69d9cb"/></marker>
+    <style>.box{fill:#12253b;stroke:#31516d;stroke-width:2;rx:16;filter:url(#shadow)}.head{font:700 20px system-ui,sans-serif;fill:#f3f8ff}.sub{font:14px system-ui,sans-serif;fill:#a9bed2}.tiny{font:12px system-ui,sans-serif;fill:#7f9bb5}.line{stroke:#69d9cb;stroke-width:3;fill:none;marker-end:url(#arrow)}.boundary{fill:none;stroke:#3d6384;stroke-width:2;stroke-dasharray:8 8;rx:26}.tag{fill:#12342f;stroke:#2e887a;rx:8}.tagtext{font:700 12px system-ui,sans-serif;fill:#6ee6ce}</style>
+  </defs>
+  <rect width="1200" height="560" rx="28" fill="url(#bg)"/>
+  <text x="54" y="58" class="head" font-size="26">Nmap Studio · local-first execution</text>
+  <rect x="42" y="88" width="1116" height="420" class="boundary"/>
+  <rect x="68" y="112" width="220" height="148" class="box"/>
+  <text x="92" y="151" class="head">Browser UI</text><text x="92" y="180" class="sub">Command builders</text><text x="92" y="204" class="sub">Scan manager</text><text x="92" y="228" class="sub">Results + exports</text>
+  <rect x="340" y="112" width="220" height="148" class="box"/>
+  <text x="364" y="151" class="head">Loopback API</text><text x="364" y="180" class="sub">Token · Host · Origin</text><text x="364" y="204" class="sub">CSP · request limits</text><rect x="364" y="220" width="112" height="25" class="tag"/><text x="380" y="237" class="tagtext">127.0.0.1 only</text>
+  <rect x="612" y="112" width="220" height="148" class="box"/>
+  <text x="636" y="151" class="head">Safety gate</text><text x="636" y="180" class="sub">Safe option allowlist</text><text x="636" y="204" class="sub">NSE category policy</text><text x="636" y="228" class="sub">Advanced confirmation</text>
+  <rect x="884" y="112" width="220" height="148" class="box"/>
+  <text x="908" y="151" class="head">Bounded queue</text><text x="908" y="180" class="sub">2 concurrent workers</text><text x="908" y="204" class="sub">Cancellation + stages</text><text x="908" y="228" class="sub">Retention limits</text>
+  <path d="M288 186 H330" class="line"/><path d="M560 186 H602" class="line"/><path d="M832 186 H874" class="line"/>
+  <rect x="205" y="326" width="300" height="126" class="box"/>
+  <text x="229" y="366" class="head">Nmap suite processes</text><text x="229" y="396" class="sub">nmap · ncat · nping · ndiff</text><text x="229" y="424" class="tiny">Argument array · no command shell</text>
+  <rect x="695" y="326" width="300" height="126" class="box"/>
+  <text x="719" y="366" class="head">Local results</text><text x="719" y="396" class="sub">Bounded output + parsed XML</text><text x="719" y="424" class="tiny">In memory · optional browser history</text>
+  <path d="M994 260 V288 H505 V316" class="line"/><path d="M505 389 H685" class="line"/><path d="M695 350 H590 V284 H178 V270" class="line"/>
+  <text x="54" y="535" class="tiny">Trust boundary: one workstation · one operating-system account · authorized targets only</text>
+</svg>

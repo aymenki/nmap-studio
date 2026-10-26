@@ -2,6 +2,25 @@
 
 All notable changes are documented here.
 
+## 0.3.0 — 2026-10-26
+
+### Added
+
+- Searchable, sortable results dashboard with JSON, CSV, and standalone HTML exports
+- Scan-to-scan comparison for new, changed, and removed ports or services
+- Named scans and projects with a two-worker queue, progress, stages, and elapsed time
+- Scan manager for reviewing or cancelling queued and running work
+- NSE safety library based on installed script categories, with guided key/value arguments
+- Server-side Safe mode enforcement for script names, categories, and script arguments
+- Architecture documentation, roadmap, screenshots, and animated product demo
+- Framework-free frontend core module with Node-based behavior tests
+
+### Changed
+
+- Release archive now includes project documentation
+- CI validates the frontend core and comparison/export behavior on every platform
+- Navigation supports direct links to the main workspace views
+
 ## 0.2.0 — 2026-10-23
 
 ### Added

@@ -9,6 +9,7 @@ import tempfile
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -143,6 +144,27 @@ class RunnerTests(unittest.TestCase):
             )
             with self.assertRaises(server.ValidationError):
                 server.parse_nmap_report(path)
+
+    def test_job_store_queues_after_running_limit(self):
+        store = server.JobStore()
+        with mock.patch.object(server, "run_job", lambda job: None):
+            jobs = [server.Job("nmap", ["127.0.0.1"], True, f"Scan {index}", "Lab") for index in range(3)]
+            for item in jobs:
+                store.add(item)
+        self.assertEqual([item.state for item in jobs], ["running", "running", "queued"])
+        listed = store.list()
+        queued = next(item for item in listed if item["state"] == "queued")
+        self.assertEqual(queued["queuePosition"], 1)
+
+    def test_nse_risk_enforcement_in_safe_mode(self):
+        scripts = [
+            {"name": "http-title", "categories": ["safe", "discovery"], "risk": "safe"},
+            {"name": "ftp-brute", "categories": ["intrusive", "brute"], "risk": "advanced"},
+        ]
+        with mock.patch.object(server, "discover_scripts", return_value=scripts):
+            server.validate_args("nmap", ["--script", "http-title", "127.0.0.1"], True, False)
+            with self.assertRaises(server.ValidationError):
+                server.validate_args("nmap", ["--script", "ftp-brute", "127.0.0.1"], True, False)
 
 
 if __name__ == "__main__":
