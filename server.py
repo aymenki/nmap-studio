@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from intelligence import refresh as refresh_intelligence
 from workspace import Workspace
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 ROOT = pathlib.Path(__file__).resolve().parent
 DATA_DIR = pathlib.Path(os.environ.get("NMAP_STUDIO_DATA_DIR", ROOT / ".nmap-studio"))
 REPORT_DIR = DATA_DIR / "reports"

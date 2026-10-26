@@ -220,6 +220,8 @@ class Workspace:
         result = {}
         for host in report.get("hosts", []):
             for service in host.get("ports", []):
+                if not str(service.get("state", "")).startswith("open"):
+                    continue
                 key = f"{host.get('address','')}|{service.get('protocol','')}|{service.get('port','')}"
                 result[key] = service
         return result

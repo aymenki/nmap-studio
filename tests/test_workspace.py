@@ -47,6 +47,16 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("new-service", kinds)
         self.assertIn("changed-service", kinds)
 
+    def test_closed_ports_do_not_create_service_drift_alerts(self):
+        value = report()
+        value["hosts"][0]["ports"].append({
+            "port": "8080", "protocol": "tcp", "state": "closed",
+            "service": "http-proxy", "product": "", "version": "", "cpes": [], "cves": [],
+        })
+        self.workspace.persist_scan(self.job("closed-port", value))
+        service_alerts = [item for item in self.workspace.alerts() if item["kind"] == "new-service"]
+        self.assertFalse(any(item["port"] == "8080/tcp" for item in service_alerts))
+
     def test_scope_allowlist_and_deny_precedence(self):
         self.workspace.add_scope_rule("Prod", "10.0.0.0/8", "allow", "CHG-42", "")
         self.workspace.add_scope_rule("Prod", "10.9.*", "deny", "Excluded segment", "")

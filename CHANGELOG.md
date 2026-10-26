@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## 0.4.2 — 2026-10-26
+
+### Fixed
+
+- Drift detection now reports only open or open-filtered services, instead of treating closed ports as newly exposed services
+
 ## 0.4.1 — 2026-10-26
 
 ### Changed
