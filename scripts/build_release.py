@@ -6,7 +6,7 @@ import pathlib
 import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 OUTPUT_DIR = ROOT / "release"
 ARCHIVE = OUTPUT_DIR / f"nmap-studio-v{VERSION}.zip"
 INCLUDE = [

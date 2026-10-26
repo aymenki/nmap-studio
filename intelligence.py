@@ -8,7 +8,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-USER_AGENT = "Nmap-Studio/0.4 (+https://github.com/aymenki/nmap-studio)"
+USER_AGENT = "Nmap-Studio/0.4.1 (+https://github.com/aymenki/nmap-studio)"
 KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 EPSS_URL = "https://api.first.org/data/v1/epss"
 NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
