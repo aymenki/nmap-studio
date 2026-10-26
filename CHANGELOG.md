@@ -2,6 +2,25 @@
 
 All notable changes are documented here.
 
+## 0.4.0 — 2026-10-26
+
+### Added
+
+- Persistent SQLite asset and service inventory with ownership, criticality, tags, and first/last-seen data
+- Explicit CISA KEV, FIRST EPSS, and cautious NVD product/version enrichment
+- Safe-mode scheduled rescans with new, missing, removed, and changed asset/service alerts
+- Finding status, assignee, due date, notes, and risk-priority workflow
+- Per-project allow/deny target scope with authorization references and expiry
+- Hash-chained local audit log with integrity verification
+- JSON, SARIF 2.1, Splunk/Elastic NDJSON, and DefectDojo CSV workspace exports
+- Tagged-release workflow with tests, checksums, and GitHub build-provenance attestations
+
+### Security
+
+- Scheduled jobs are always revalidated in Safe mode and against current scope rules
+- External intelligence requests require explicit confirmation and use bounded responses and timeouts
+- SQLite connections are explicitly closed to prevent locked workspace files on Windows
+
 ## 0.3.0 — 2026-10-26
 
 ### Added

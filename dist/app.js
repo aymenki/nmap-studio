@@ -79,12 +79,13 @@ const state = {
 };
 
 const names = {
-  nmap: "Scan builder", scans: "Scan manager", scripts: "Script library",
-  results: "Results dashboard", ncat: "Ncat", nping: "Nping",
+  nmap: "Scan builder", scans: "Scan manager", assets: "Asset inventory",
+  findings: "Findings", schedules: "Monitoring", governance: "Scope & audit",
+  integrations: "Integrations", scripts: "Script library", results: "Results dashboard", ncat: "Ncat", nping: "Nping",
   ndiff: "Ndiff", reference: "Tool reference", settings: "Settings",
 };
 const icons = {
-  nmap: "⌘", scans: "◷", scripts: "▧", results: "▦", ncat: "⇄",
+  nmap: "⌘", scans: "◷", assets: "◉", findings: "!", schedules: "↻", governance: "◇", integrations: "⇢", scripts: "▧", results: "▦", ncat: "⇄",
   nping: "⌁", ndiff: "⊞", reference: "▤", settings: "⚙",
 };
 
@@ -371,6 +372,12 @@ async function start() {
     if (!settings.safeMode && !confirm("Advanced mode can run all options supported by the installed tool with your account permissions. Continue?")) {
       return executionMessage(null, "Advanced execution cancelled.");
     }
+    const scope = await api("/api/scope/preview", {tool, args, project: state[tool].project,
+      safeMode: settings.safeMode, confirmAdvanced: !settings.safeMode});
+    if (!scope.allowed) throw new Error("Targets outside the active project scope: " + scope.rejected.join(", "));
+    if (scope.intensity === "high" && !confirm("This profile uses high-impact discovery options. Confirm that the targets and timing are authorized.")) {
+      return executionMessage(null, "Execution cancelled before the high-impact scan started.");
+    }
     const created = await api("/api/run", {
       tool, args, name: state[tool].name, project: state[tool].project,
       safeMode: settings.safeMode, confirmAdvanced: !settings.safeMode,
@@ -650,6 +657,174 @@ function renderProfiles() {
   });
 }
 
+async function assetsPage() {
+  $("#page").innerHTML = '<div class="card pad"><h2>Persistent asset inventory</h2><p>Loading the local workspace…</p></div>';
+  try {
+    const [summary, payload] = await Promise.all([api("/api/workspace/summary"), api("/api/workspace/assets")]);
+    const assets = payload.assets || [];
+    $("#page").innerHTML = `<div class="stat-grid"><div class="stat"><span>Assets</span><b>${summary.assets}</b></div>
+      <div class="stat"><span>Open services</span><b>${summary.openServices}</b></div><div class="stat"><span>Unreviewed drift</span><b>${summary.unacknowledgedAlerts}</b></div></div>
+      <div class="card pad"><div class="card-head"><div><h2>Assets and ownership</h2><p class="hint">Inventory data stays in the local SQLite workspace.</p></div>
+      <input class="compact-input" id="assetSearch" placeholder="Search address, hostname or project"></div>
+      <div class="table-wrap"><table><thead><tr><th>ASSET</th><th>PROJECT</th><th>SERVICES</th><th>OWNER</th><th>CRITICALITY</th><th>TAGS</th><th></th></tr></thead><tbody id="assetRows"></tbody></table></div></div>`;
+    const draw = () => {
+      const query = $("#assetSearch").value.toLowerCase();
+      const visible = assets.filter(item => [item.address, item.hostname, item.project].join(" ").toLowerCase().includes(query));
+      $("#assetRows").innerHTML = visible.length ? visible.map(item => `<tr><td><strong>${esc(item.address)}</strong><br><span class="hint">${esc(item.hostname || "No hostname")}</span></td>
+        <td>${esc(item.project)}</td><td>${item.open_ports || 0} open / ${item.service_count || 0} seen</td>
+        <td><input data-asset-owner="${item.id}" value="${esc(item.owner)}" placeholder="Owner or team"></td>
+        <td><select data-asset-criticality="${item.id}">${["low","medium","high","critical"].map(value => `<option ${item.criticality === value ? "selected" : ""}>${value}</option>`).join("")}</select></td>
+        <td><input data-asset-tags="${item.id}" value="${esc((item.tags || []).join(", "))}" placeholder="production, dmz"></td>
+        <td><button data-save-asset="${item.id}">Save</button></td></tr>`).join("") : '<tr><td colspan="7" class="empty">No assets yet. Complete an Nmap scan to populate the inventory.</td></tr>';
+      $$('[data-save-asset]').forEach(button => button.onclick = async () => {
+        const id = button.dataset.saveAsset;
+        try {
+          await api("/api/workspace/asset", {id: Number(id), owner: $(`[data-asset-owner="${id}"]`).value,
+            criticality: $(`[data-asset-criticality="${id}"]`).value,
+            tags: $(`[data-asset-tags="${id}"]`).value.split(",").map(value => value.trim()).filter(Boolean)});
+          toast("Asset metadata saved");
+        } catch (error) { showError(error); }
+      });
+    };
+    $("#assetSearch").oninput = draw;
+    draw();
+  } catch (error) { showError(error); }
+}
+
+async function findingsPage() {
+  $("#page").innerHTML = '<div class="card pad"><h2>Finding workflow</h2><p>Loading findings…</p></div>';
+  try {
+    const [summary, payload, intelligence] = await Promise.all([
+      api("/api/workspace/summary"), api("/api/workspace/findings"), api("/api/enrichment/status"),
+    ]);
+    const findings = payload.findings || [];
+    $("#page").innerHTML = `<div class="stat-grid"><div class="stat"><span>Open findings</span><b>${summary.openFindings}</b></div>
+      <div class="stat"><span>Known exploited</span><b>${summary.kev}</b></div><div class="stat"><span>Intelligence</span><b class="small-stat">${esc(intelligence.state)}</b></div></div>
+      <div class="card pad"><div class="card-head"><div><h2>Risk-based findings</h2><p class="hint">CVE matches are candidates until a human validates the affected product and version.</p></div>
+      <div class="actions"><button id="refreshIntel">Refresh CISA KEV · FIRST EPSS · NVD</button><button id="reloadFindings">Reload</button></div></div>
+      <div class="filter-grid three"><input id="findingSearch" placeholder="Search CVE, asset, product or assignee"><select id="findingStatus"><option value="">All states</option>${["open","investigating","accepted","false-positive","resolved"].map(value => `<option>${value}</option>`).join("")}</select>
+      <select id="findingSeverity"><option value="">All severities</option>${["critical","high","medium","low","unknown"].map(value => `<option>${value}</option>`).join("")}</select></div>
+      <div id="findingRows"></div></div>`;
+    const draw = () => {
+      const search = $("#findingSearch").value.toLowerCase(), status = $("#findingStatus").value, severity = $("#findingSeverity").value;
+      const visible = findings.filter(item => (!status || item.status === status) && (!severity || item.severity === severity)
+        && [item.cve, item.address, item.hostname, item.product, item.assignee, item.title].join(" ").toLowerCase().includes(search));
+      $("#findingRows").innerHTML = visible.length ? visible.map(item => `<article class="finding-row"><div class="finding-title"><div><strong>${esc(item.cve || item.title)}</strong>
+        <span class="status severity-${esc(item.severity)}">${esc(item.severity)}</span>${item.kev ? '<span class="status status-failed">CISA KEV</span>' : ""}${item.epss != null ? `<span class="pill">EPSS ${(Number(item.epss) * 100).toFixed(1)}%</span>` : ""}</div>
+        <p>${esc(item.address || "")} : ${esc(item.port || "—")}/${esc(item.protocol || "")} · ${esc(item.product || item.service || "Unknown service")} ${esc(item.version || "")} · ${esc(item.confidence)} match</p></div>
+        <div class="finding-fields"><select data-finding-status="${item.id}">${["open","investigating","accepted","false-positive","resolved"].map(value => `<option ${item.status === value ? "selected" : ""}>${value}</option>`).join("")}</select>
+        <input data-finding-assignee="${item.id}" value="${esc(item.assignee)}" placeholder="Assignee"><input type="date" data-finding-due="${item.id}" value="${esc(item.due_date)}">
+        <input data-finding-notes="${item.id}" value="${esc(item.notes)}" placeholder="Validation or remediation notes"><button data-save-finding="${item.id}">Save</button></div></article>`).join("")
+        : '<div class="empty">No findings match. Run service/NSE detection, then refresh intelligence.</div>';
+      $$('[data-save-finding]').forEach(button => button.onclick = async () => {
+        const id = button.dataset.saveFinding;
+        try {
+          await api("/api/workspace/finding", {id: Number(id), status: $(`[data-finding-status="${id}"]`).value,
+            assignee: $(`[data-finding-assignee="${id}"]`).value, dueDate: $(`[data-finding-due="${id}"]`).value,
+            notes: $(`[data-finding-notes="${id}"]`).value});
+          toast("Finding updated and audited");
+        } catch (error) { showError(error); }
+      });
+    };
+    ["findingSearch", "findingStatus", "findingSeverity"].forEach(id => $("#" + id).oninput = draw);
+    draw();
+    $("#reloadFindings").onclick = findingsPage;
+    $("#refreshIntel").onclick = async () => {
+      if (!confirm("This sends detected product/version keywords and existing CVE identifiers to public CISA, FIRST, and NVD services. Continue?")) return;
+      try { await api("/api/enrichment/refresh", {confirmExternal: true}); toast("Intelligence refresh started"); monitorIntelligence(); }
+      catch (error) { showError(error); }
+    };
+  } catch (error) { showError(error); }
+}
+
+async function monitorIntelligence() {
+  for (let attempt = 0; attempt < 90 && current === "findings"; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    try {
+      const value = await api("/api/enrichment/status");
+      if (value.state === "completed") { toast(`Intelligence ready · ${value.candidates || 0} candidate matches`); return findingsPage(); }
+      if (value.state === "failed") throw new Error(value.error || "Intelligence refresh failed");
+    } catch (error) { return showError(error); }
+  }
+}
+
+function scheduleEvery(minutes) {
+  if (minutes % 1440 === 0) return `${minutes / 1440} day${minutes === 1440 ? "" : "s"}`;
+  if (minutes % 60 === 0) return `${minutes / 60} hour${minutes === 60 ? "" : "s"}`;
+  return `${minutes} minutes`;
+}
+
+async function monitoringPage() {
+  $("#page").innerHTML = '<div class="card pad"><h2>Continuous monitoring</h2><p>Loading schedules and drift…</p></div>';
+  try {
+    const [schedulePayload, alertPayload] = await Promise.all([api("/api/workspace/schedules"), api("/api/workspace/alerts")]);
+    const schedules = schedulePayload.schedules || [], alerts = alertPayload.alerts || [];
+    const previous = current; current = "nmap"; let args;
+    try { args = commandArgs(); } finally { current = previous; }
+    $("#page").innerHTML = `<div class="grid"><div><div class="card pad"><h2>Schedule the current Nmap profile</h2>
+      <p class="hint">Scheduled execution is always restricted to Safe mode and active project scope rules.</p>
+      <div class="row">${field("scheduleName", "Schedule name", state.nmap.name)}${field("scheduleProject", "Project", state.nmap.project)}</div>
+      <div class="row">${select("scheduleInterval", "Frequency", [["60","Hourly"],["360","Every 6 hours"],["1440","Daily"],["10080","Weekly"]], "1440")}<div><label>Command</label><code class="inline-code">${esc("nmap " + args.join(" "))}</code></div></div>
+      <button class="primary" id="createSchedule">Create schedule</button></div>
+      <div class="card pad"><h2>Drift alerts</h2><div id="alertList">${alerts.length ? alerts.map(item => `<article class="scan-row ${item.acknowledged ? "muted" : ""}"><div><strong>${esc(item.kind)}</strong><p>${esc(item.address)} ${esc(item.port)} · ${esc(item.detail)}</p></div>${item.acknowledged ? '<span class="pill">Reviewed</span>' : `<button data-ack-alert="${item.id}">Acknowledge</button>`}</article>`).join("") : '<div class="empty">No drift detected yet.</div>'}</div></div></div>
+      <div><div class="card pad"><h2>Schedules</h2>${schedules.length ? schedules.map(item => `<div class="schedule-card"><strong>${esc(item.name)}</strong><p>${esc(item.project)} · every ${esc(scheduleEvery(item.interval_minutes))}</p><p class="hint">Next: ${new Date(item.next_run * 1000).toLocaleString()}</p><button data-toggle-schedule="${item.id}" data-enabled="${item.enabled ? "1" : "0"}">${item.enabled ? "Pause" : "Enable"}</button></div>`).join("") : '<div class="empty">No schedules configured.</div>'}</div></div></div>`;
+    $("#createSchedule").onclick = async () => {
+      try {
+        await api("/api/workspace/schedule", {name: $("#scheduleName").value, project: $("#scheduleProject").value,
+          tool: "nmap", args, intervalMinutes: Number($("#scheduleInterval").value)});
+        toast("Safe-mode schedule created"); monitoringPage();
+      } catch (error) { showError(error); }
+    };
+    $$('[data-toggle-schedule]').forEach(button => button.onclick = async () => {
+      try { await api("/api/workspace/schedule-state", {id: Number(button.dataset.toggleSchedule), enabled: button.dataset.enabled !== "1"}); monitoringPage(); }
+      catch (error) { showError(error); }
+    });
+    $$('[data-ack-alert]').forEach(button => button.onclick = async () => {
+      try { await api("/api/workspace/alert", {id: Number(button.dataset.ackAlert)}); monitoringPage(); }
+      catch (error) { showError(error); }
+    });
+  } catch (error) { showError(error); }
+}
+
+async function governancePage() {
+  $("#page").innerHTML = '<div class="card pad"><h2>Scope and audit</h2><p>Loading governance controls…</p></div>';
+  try {
+    const [scopePayload, auditPayload] = await Promise.all([api("/api/workspace/scopes"), api("/api/workspace/audit")]);
+    const scopes = scopePayload.scopes || [], entries = auditPayload.entries || [], verification = auditPayload.verification || {};
+    $("#page").innerHTML = `<div class="grid"><div><div class="card pad"><h2>Authorized target scope</h2><p class="hint">Once a project has an active allow rule, every target must match one. Deny rules always win.</p>
+      <div class="row">${field("scopeProject", "Project", state.nmap.project)}${field("scopePattern", "Target pattern", "", "10.0.0.0/24 or *.example.test")}</div>
+      <div class="row">${select("scopeAction", "Action", [["allow","Allow"],["deny","Deny"]], "allow")}${field("authorizationRef", "Authorization reference", "", "Ticket, engagement or owner approval")}</div>
+      ${field("scopeExpires", "Expiry (optional)", "", "2026-12-31 or Unix timestamp")}<button class="primary" id="addScope">Add scope rule</button></div>
+      <div class="card pad"><h2>Rules</h2>${scopes.length ? scopes.map(item => `<article class="scan-row ${item.active ? "" : "muted"}"><div><strong>${esc(item.action.toUpperCase())} · ${esc(item.pattern)}</strong><p>${esc(item.project)} · ${esc(item.authorization_ref || "No reference")}${item.expires ? ` · expires ${new Date(Number(item.expires) * 1000).toLocaleString()}` : ""}</p></div>${item.active ? `<button data-disable-scope="${item.id}">Deactivate</button>` : '<span class="pill">Inactive</span>'}</article>`).join("") : '<div class="empty">No scope rules. Add an allowlist before scheduled production scanning.</div>'}</div></div>
+      <div><div class="card pad"><h2>Append-only audit chain</h2><p class="${verification.valid ? "success" : "danger"}">${verification.valid ? "Verified" : "Verification failed"} · ${verification.checked || 0} entries</p>
+      <div class="audit-list">${entries.slice(0,100).map(item => `<div class="audit-entry"><strong>${esc(item.event)}</strong><span>${new Date(item.at * 1000).toLocaleString()}</span><code>${esc(item.entry_hash.slice(0,12))}</code></div>`).join("") || '<div class="empty">No audit events yet.</div>'}</div></div></div></div>`;
+    $("#addScope").onclick = async () => {
+      try { await api("/api/workspace/scope", {project: $("#scopeProject").value, pattern: $("#scopePattern").value, action: $("#scopeAction").value, authorizationRef: $("#authorizationRef").value, expires: $("#scopeExpires").value}); governancePage(); }
+      catch (error) { showError(error); }
+    };
+    $$('[data-disable-scope]').forEach(button => button.onclick = async () => {
+      if (!confirm("Deactivate this scope rule? The audit record will remain.")) return;
+      try { await api("/api/workspace/scope-state", {id: Number(button.dataset.disableScope)}); governancePage(); }
+      catch (error) { showError(error); }
+    });
+  } catch (error) { showError(error); }
+}
+
+async function integrationsPage() {
+  $("#page").innerHTML = `<div class="grid"><div class="card pad"><h2>Security workflow exports</h2><p>Exports are generated locally and downloaded by your browser. Nothing is sent automatically.</p>
+    <div class="integration-grid"><button data-export-workspace="json"><strong>Workspace JSON</strong><span>Assets, findings and drift alerts</span></button>
+    <button data-export-workspace="sarif"><strong>SARIF 2.1</strong><span>Security result interchange</span></button>
+    <button data-export-workspace="splunk"><strong>NDJSON</strong><span>Splunk and Elastic ingestion</span></button>
+    <button data-export-workspace="defectdojo"><strong>DefectDojo CSV</strong><span>Finding import workflow</span></button></div></div>
+    <div class="card pad"><h2>Release provenance</h2><p>Tagged releases run the complete cross-platform test matrix, build the archive and checksum, create a GitHub artifact attestation, and publish verified assets.</p>
+    <a href="https://github.com/aymenki/nmap-studio/attestations" target="_blank" rel="noreferrer">View GitHub attestations ↗</a></div></div>`;
+  const namesByFormat = {json: "nmap-studio-workspace.json", sarif: "nmap-studio-results.sarif", splunk: "nmap-studio-events.ndjson", defectdojo: "nmap-studio-defectdojo.csv"};
+  $$('[data-export-workspace]').forEach(button => button.onclick = async () => {
+    try { download(namesByFormat[button.dataset.exportWorkspace], await apiText("/api/export?format=" + button.dataset.exportWorkspace)); }
+    catch (error) { showError(error); }
+  });
+}
+
 function settingsPage() {
   $("#page").innerHTML = `<div class="grid"><div class="card pad"><h2>Privacy and execution</h2>
     <div class="checks"><label><input id="persistHistory" type="checkbox" ${settings.persistHistory ? "checked" : ""}> Save completed output in this browser</label>
@@ -698,6 +873,9 @@ function show(page) {
   $("#breadcrumb").textContent = names[page];
   $("#subtitle").textContent = {
     nmap: "Build precise, authorized network scans.", scans: "Track queued, running, and completed work.",
+    assets: "Own and classify the systems you discover.", findings: "Validate, prioritize, assign, and resolve security findings.",
+    schedules: "Rescan approved scope and review network drift.", governance: "Enforce authorization and verify the audit chain.",
+    integrations: "Move local results into defensive workflows.",
     scripts: "Choose NSE scripts with clear safety classifications.", results: "Search, compare, and export network findings.",
     ncat: "Use Ncat from the local workspace.", nping: "Measure how a network responds.",
     ndiff: "Compare Nmap XML reports.", reference: "Read help from installed tools.",
@@ -711,7 +889,8 @@ function show(page) {
     show(button.dataset.page);
   });
   if (state[page]) builder();
-  else ({scans: renderScans, scripts, results, reference, settings: settingsPage}[page])();
+  else ({scans: renderScans, assets: assetsPage, findings: findingsPage, schedules: monitoringPage,
+    governance: governancePage, integrations: integrationsPage, scripts, results, reference, settings: settingsPage}[page])();
 }
 
 async function connectRunner() {

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560" role="img" aria-labelledby="title desc">
   <title id="title">Nmap Studio architecture</title>
-  <desc id="desc">A local browser connects through a protected loopback API to validation, a bounded queue, Nmap suite processes, and local in-memory results.</desc>
+  <desc id="desc">A local browser connects through a protected loopback API to validation, target scope controls, a bounded queue, Nmap suite processes, a persistent SQLite security workspace, and optional public vulnerability intelligence.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#07111f"/><stop offset="1" stop-color="#111f34"/></linearGradient>
     <linearGradient id="cyan" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#52e5c4"/><stop offset="1" stop-color="#48a7ff"/></linearGradient>
@@ -16,14 +16,16 @@
   <rect x="340" y="112" width="220" height="148" class="box"/>
   <text x="364" y="151" class="head">Loopback API</text><text x="364" y="180" class="sub">Token · Host · Origin</text><text x="364" y="204" class="sub">CSP · request limits</text><rect x="364" y="220" width="112" height="25" class="tag"/><text x="380" y="237" class="tagtext">127.0.0.1 only</text>
   <rect x="612" y="112" width="220" height="148" class="box"/>
-  <text x="636" y="151" class="head">Safety gate</text><text x="636" y="180" class="sub">Safe option allowlist</text><text x="636" y="204" class="sub">NSE category policy</text><text x="636" y="228" class="sub">Advanced confirmation</text>
+  <text x="636" y="151" class="head">Safety + scope gate</text><text x="636" y="180" class="sub">Safe option allowlist</text><text x="636" y="204" class="sub">Project allow / deny rules</text><text x="636" y="228" class="sub">Advanced confirmation</text>
   <rect x="884" y="112" width="220" height="148" class="box"/>
   <text x="908" y="151" class="head">Bounded queue</text><text x="908" y="180" class="sub">2 concurrent workers</text><text x="908" y="204" class="sub">Cancellation + stages</text><text x="908" y="228" class="sub">Retention limits</text>
   <path d="M288 186 H330" class="line"/><path d="M560 186 H602" class="line"/><path d="M832 186 H874" class="line"/>
-  <rect x="205" y="326" width="300" height="126" class="box"/>
-  <text x="229" y="366" class="head">Nmap suite processes</text><text x="229" y="396" class="sub">nmap · ncat · nping · ndiff</text><text x="229" y="424" class="tiny">Argument array · no command shell</text>
-  <rect x="695" y="326" width="300" height="126" class="box"/>
-  <text x="719" y="366" class="head">Local results</text><text x="719" y="396" class="sub">Bounded output + parsed XML</text><text x="719" y="424" class="tiny">In memory · optional browser history</text>
-  <path d="M994 260 V288 H505 V316" class="line"/><path d="M505 389 H685" class="line"/><path d="M695 350 H590 V284 H178 V270" class="line"/>
+  <rect x="90" y="326" width="280" height="126" class="box"/>
+  <text x="114" y="366" class="head">Nmap suite processes</text><text x="114" y="396" class="sub">nmap · ncat · nping · ndiff</text><text x="114" y="424" class="tiny">Argument array · no command shell</text>
+  <rect x="460" y="326" width="280" height="126" class="box"/>
+  <text x="484" y="366" class="head">SQLite workspace</text><text x="484" y="396" class="sub">Assets · findings · drift · audit</text><text x="484" y="424" class="tiny">Local persistence · bounded API views</text>
+  <rect x="830" y="326" width="280" height="126" class="box"/>
+  <text x="854" y="366" class="head">Optional intelligence</text><text x="854" y="396" class="sub">CISA KEV · FIRST EPSS · NVD</text><text x="854" y="424" class="tiny">Explicit confirmation · public APIs</text>
+  <path d="M994 260 V288 H370 V316" class="line"/><path d="M370 389 H450" class="line"/><path d="M740 389 H820" class="line"/><path d="M460 350 H410 V284 H178 V270" class="line"/>
   <text x="54" y="535" class="tiny">Trust boundary: one workstation · one operating-system account · authorized targets only</text>
 </svg>

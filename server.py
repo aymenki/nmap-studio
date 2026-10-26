@@ -20,11 +20,14 @@ import webbrowser
 import xml.etree.ElementTree as ET
 from collections import OrderedDict, deque
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
-VERSION = "0.3.0"
+from intelligence import refresh as refresh_intelligence
+from workspace import Workspace
+
+VERSION = "0.4.0"
 ROOT = pathlib.Path(__file__).resolve().parent
-DATA_DIR = ROOT / ".nmap-studio"
+DATA_DIR = pathlib.Path(os.environ.get("NMAP_STUDIO_DATA_DIR", ROOT / ".nmap-studio"))
 REPORT_DIR = DATA_DIR / "reports"
 LOG_DIR = DATA_DIR / "logs"
 LOG_FILE = LOG_DIR / "nmap-studio.log"
@@ -50,6 +53,8 @@ SCRIPT_CACHE: list[dict] = []
 SCRIPT_CACHE_TIME = 0.0
 SCRIPT_CACHE_LOCK = threading.Lock()
 RISKY_NSE_CATEGORIES = {"auth", "brute", "dos", "exploit", "external", "fuzzer", "intrusive", "malware", "vuln"}
+INTELLIGENCE_STATE: dict = {"state": "idle", "stage": "Not started", "completed": 0, "total": 3, "error": ""}
+INTELLIGENCE_LOCK = threading.Lock()
 
 PLAIN_SAFE_FLAGS = {
     "nmap": {
@@ -87,6 +92,7 @@ def configure_logging() -> logging.Logger:
 
 
 LOGGER = configure_logging()
+WORKSPACE = Workspace(DATA_DIR / "studio.db")
 
 
 def resolve_command(tool: str) -> list[str]:
@@ -181,6 +187,40 @@ def validate_safe_scripts(value: str) -> None:
         raise ValidationError("These NSE scripts require Advanced mode: " + ", ".join(risky[:5]))
 
 
+def extract_targets(tool: str, args: list[str]) -> list[str]:
+    """Extract scan targets without treating option values as targets."""
+    if tool == "ndiff":
+        return []
+    values = set(VALUE_SAFE_FLAGS.get(tool, set()))
+    if tool == "nmap":
+        values.update({"--script", "--script-args", "-oX", "-oN", "-oG", "-oA", "-oS", "--stylesheet"})
+    targets = []
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+            continue
+        if arg in values:
+            skip = True
+            continue
+        if arg.startswith("-"):
+            continue
+        targets.append(arg)
+    if tool in {"ncat", "nping"} and targets and targets[-1].isdigit():
+        targets.pop()
+    return targets
+
+
+def scope_preview(project: str, tool: str, args: list[str]) -> dict:
+    targets = extract_targets(tool, args)
+    result = WORKSPACE.check_scope(project, targets)
+    result["targets"] = targets
+    result["targetCount"] = len(targets)
+    risky = [arg for arg in args if arg in {"-sU", "-O", "-A", "-T5", "--script"}]
+    result["intensity"] = "high" if risky else ("medium" if "-sV" in args else "low")
+    return result
+
+
 def parse_nmap_report(path: pathlib.Path) -> dict | None:
     if not path.exists() or path.stat().st_size > MAX_XML_BYTES:
         return None
@@ -193,7 +233,9 @@ def parse_nmap_report(path: pathlib.Path) -> dict | None:
     for host_element in root.findall("host"):
         if len(hosts) >= MAX_XML_HOSTS:
             break
-        address = host_element.find("address")
+        addresses = host_element.findall("address")
+        address = next((item for item in addresses if item.get("addrtype") in {"ipv4", "ipv6"}), addresses[0] if addresses else None)
+        mac_element = next((item for item in addresses if item.get("addrtype") == "mac"), None)
         status = host_element.find("status")
         hostname = host_element.find("hostnames/hostname")
         ports: list[dict] = []
@@ -202,6 +244,8 @@ def parse_nmap_report(path: pathlib.Path) -> dict | None:
                 break
             state = port_element.find("state")
             service = port_element.find("service")
+            scripts = [{"id": item.get("id", ""), "output": item.get("output", "")} for item in port_element.findall("script")]
+            script_text = " ".join(item["id"] + " " + item["output"] for item in scripts)
             ports.append({
                 "port": port_element.get("portid", ""),
                 "protocol": port_element.get("protocol", ""),
@@ -209,11 +253,16 @@ def parse_nmap_report(path: pathlib.Path) -> dict | None:
                 "service": service.get("name", "") if service is not None else "",
                 "product": service.get("product", "") if service is not None else "",
                 "version": service.get("version", "") if service is not None else "",
+                "confidence": int(service.get("conf", "0") or 0) if service is not None else 0,
+                "cpes": [item.text or "" for item in service.findall("cpe")] if service is not None else [],
+                "scripts": scripts,
+                "cves": sorted(set(re.findall(r"CVE-\d{4}-\d{4,}", script_text, re.IGNORECASE))),
             })
             port_count += 1
         hosts.append({
             "address": address.get("addr", "") if address is not None else "",
             "hostname": hostname.get("name", "") if hostname is not None else "",
+            "mac": mac_element.get("addr", "") if mac_element is not None else "",
             "state": status.get("state", "") if status is not None else "",
             "ports": ports,
         })
@@ -227,13 +276,14 @@ def parse_nmap_report(path: pathlib.Path) -> dict | None:
 
 
 class Job:
-    def __init__(self, tool: str, args: list[str], safe_mode: bool, name: str = "", project: str = ""):
+    def __init__(self, tool: str, args: list[str], safe_mode: bool, name: str = "", project: str = "", schedule_id: int | None = None):
         self.id = uuid.uuid4().hex
         self.tool = tool
         self.args = args
         self.safe_mode = safe_mode
         self.name = name or f"{tool} scan"
         self.project = project or "Default"
+        self.schedule_id = schedule_id
         self.created = time.time()
         self.started: float | None = None
         self.finished: float | None = None
@@ -307,6 +357,7 @@ class Job:
             result = {
                 "id": self.id, "tool": self.tool, "args": self.args,
                 "name": self.name, "project": self.project,
+                "scheduleId": self.schedule_id,
                 "safeMode": self.safe_mode, "created": self.created,
                 "started": self.started, "finished": self.finished, "done": self.done,
                 "cancelled": self.cancelled, "code": self.code,
@@ -405,6 +456,47 @@ class JobStore:
 JOBS = JobStore()
 
 
+class ScheduleRunner:
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._loop, daemon=True, name="schedule-runner")
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(15):
+            self.run_due()
+
+    def run_due(self) -> None:
+        for schedule in WORKSPACE.schedules(due_only=True):
+            try:
+                args = validate_args(schedule["tool"], schedule["args"], True, False)
+                preview = scope_preview(schedule["project"], schedule["tool"], args)
+                if not preview["allowed"]:
+                    raise ValidationError("Scheduled targets are outside the active scope")
+                job = Job(schedule["tool"], args, True, schedule["name"], schedule["project"], int(schedule["id"]))
+                JOBS.add(job)
+                WORKSPACE.schedule_ran(int(schedule["id"]))
+                WORKSPACE.audit("schedule.queued", {"scheduleId": schedule["id"], "jobId": job.id, "targets": preview["targets"]})
+            except Exception as exc:
+                WORKSPACE.schedule_ran(int(schedule["id"]))
+                WORKSPACE.audit("schedule.failed", {"scheduleId": schedule["id"], "error": str(exc)[:500]})
+                LOGGER.exception("schedule=%s could not be queued", schedule["id"])
+
+
+SCHEDULER = ScheduleRunner()
+
+
 def terminate_process(process: subprocess.Popen) -> None:
     if process.poll() is not None:
         return
@@ -465,11 +557,19 @@ def run_job(job: Job) -> None:
         if process.stdin and not process.stdin.closed:
             process.stdin.close()
         job.finish(code, report)
+        if report:
+            try:
+                WORKSPACE.persist_scan(job)
+            except Exception:
+                LOGGER.exception("job=%s could not be persisted", job.id)
+        else:
+            WORKSPACE.audit("scan.finished", {"jobId": job.id, "state": job.state, "code": code, "project": job.project})
         LOGGER.info("job=%s tool=%s code=%s cancelled=%s", job.id, job.tool, code, job.cancelled)
     except Exception as exc:
         LOGGER.exception("job=%s failed", job.id)
         job.append((str(exc) + "\n").encode("utf-8"))
         job.finish(-1)
+        WORKSPACE.audit("scan.failed", {"jobId": job.id, "project": job.project, "error": type(exc).__name__})
     finally:
         JOBS.finished(job)
 
@@ -543,6 +643,23 @@ def log_tail(max_bytes: int = 200_000) -> str:
     with LOG_FILE.open("rb") as handle:
         handle.seek(max(0, LOG_FILE.stat().st_size - max_bytes))
         return handle.read().decode("utf-8", errors="replace")
+
+
+def start_intelligence_refresh() -> None:
+    with INTELLIGENCE_LOCK:
+        if INTELLIGENCE_STATE.get("state") == "running":
+            raise ValidationError("Intelligence refresh is already running")
+        INTELLIGENCE_STATE.update({"state": "starting", "stage": "Starting", "completed": 0, "total": 3, "error": ""})
+
+    def worker() -> None:
+        try:
+            refresh_intelligence(WORKSPACE, INTELLIGENCE_STATE)
+        except Exception as exc:
+            LOGGER.exception("Intelligence refresh failed")
+            INTELLIGENCE_STATE.update({"state": "failed", "stage": "Failed", "error": str(exc)[:500]})
+            WORKSPACE.audit("intelligence.failed", {"error": str(exc)[:500]})
+
+    threading.Thread(target=worker, daemon=True, name="intelligence-refresh").start()
 
 
 class StudioServer(ThreadingHTTPServer):
@@ -626,7 +743,9 @@ class Handler(SimpleHTTPRequestHandler):
         if not self.valid_host():
             self.send_json(403, {"error": "Invalid Host header"})
             return
-        path = urlsplit(self.path).path
+        parsed = urlsplit(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
         if path == "/api/status":
             tools = all_tool_status()
             self.send_json(200, {"ok": True, "version": VERSION, "token": self.server.token, "tools": tools, "safeModeDefault": True})
@@ -636,6 +755,37 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json(403, {"error": "Invalid session token"})
                 return
             self.send_json(200, {"jobs": JOBS.list()})
+            return
+        if path.startswith("/api/workspace/") or path in {"/api/enrichment/status", "/api/export"}:
+            if not self.authorized():
+                self.send_json(403, {"error": "Invalid session token"})
+                return
+            if path == "/api/workspace/summary":
+                self.send_json(200, WORKSPACE.summary())
+            elif path == "/api/workspace/assets":
+                self.send_json(200, {"assets": WORKSPACE.assets((query.get("q") or [""])[0])})
+            elif path == "/api/workspace/findings":
+                self.send_json(200, {"findings": WORKSPACE.findings()})
+            elif path == "/api/workspace/alerts":
+                self.send_json(200, {"alerts": WORKSPACE.alerts()})
+            elif path == "/api/workspace/schedules":
+                self.send_json(200, {"schedules": WORKSPACE.schedules()})
+            elif path == "/api/workspace/scopes":
+                self.send_json(200, {"scopes": WORKSPACE.scopes()})
+            elif path == "/api/workspace/audit":
+                self.send_json(200, {"entries": WORKSPACE.audit_entries(), "verification": WORKSPACE.verify_audit()})
+            elif path == "/api/enrichment/status":
+                self.send_json(200, dict(INTELLIGENCE_STATE))
+            elif path == "/api/export":
+                format_name = (query.get("format") or ["json"])[0]
+                if format_name not in {"json", "sarif", "splunk", "defectdojo"}:
+                    self.send_json(400, {"error": "Unknown export format"})
+                    return
+                content_type, payload = WORKSPACE.export(format_name)
+                WORKSPACE.audit("integration.export", {"format": format_name})
+                self.send_text(200, payload, content_type + "; charset=utf-8")
+            else:
+                self.send_json(404, {"error": "Not found"})
             return
         if path.startswith("/api/jobs/"):
             if not self.authorized():
@@ -686,9 +836,61 @@ class Handler(SimpleHTTPRequestHandler):
                     raise ValidationError("Scan name must be 80 characters or fewer")
                 if not isinstance(project, str) or len(project.strip()) > 80:
                     raise ValidationError("Project name must be 80 characters or fewer")
-                job = Job(tool, args, safe_mode is not False, name.strip(), project.strip())
+                project = project.strip() or "Default"
+                preview = scope_preview(project, tool, args)
+                if not preview["allowed"]:
+                    WORKSPACE.audit("scope.rejected", {"project": project, "targets": preview["rejected"], "tool": tool})
+                    raise ValidationError("Targets outside the active project scope: " + ", ".join(preview["rejected"][:5]))
+                job = Job(tool, args, safe_mode is not False, name.strip(), project)
                 JOBS.add(job)
+                WORKSPACE.audit("scan.queued", {"jobId": job.id, "name": job.name, "project": project, "tool": tool, "safeMode": job.safe_mode, "targets": preview["targets"], "intensity": preview["intensity"]})
                 self.send_json(202, {"id": job.id, "state": job.state})
+                return
+            if path == "/api/scope/preview":
+                tool = body.get("tool")
+                args = validate_args(tool, body.get("args"), body.get("safeMode", True), body.get("confirmAdvanced"))
+                project = str(body.get("project", "Default"))[:80] or "Default"
+                self.send_json(200, scope_preview(project, tool, args))
+                return
+            if path == "/api/workspace/asset":
+                WORKSPACE.update_asset(int(body.get("id")), str(body.get("owner", "")), str(body.get("criticality", "medium")), body.get("tags") if isinstance(body.get("tags"), list) else [])
+                self.send_json(200, {"ok": True})
+                return
+            if path == "/api/workspace/finding":
+                WORKSPACE.update_finding(int(body.get("id")), str(body.get("status", "open")), str(body.get("assignee", "")), str(body.get("dueDate", "")), str(body.get("notes", "")))
+                self.send_json(200, {"ok": True})
+                return
+            if path == "/api/workspace/alert":
+                WORKSPACE.acknowledge_alert(int(body.get("id")))
+                self.send_json(200, {"ok": True})
+                return
+            if path == "/api/workspace/schedule":
+                tool = body.get("tool")
+                args = validate_args(tool, body.get("args"), True, False)
+                project = str(body.get("project", "Default"))[:80] or "Default"
+                preview = scope_preview(project, tool, args)
+                if not preview["allowed"]:
+                    raise ValidationError("Scheduled targets are outside the active project scope")
+                result = WORKSPACE.add_schedule(str(body.get("name", "Scheduled scan")), project, tool, args, int(body.get("intervalMinutes", 1440)), True)
+                self.send_json(201, result)
+                return
+            if path == "/api/workspace/schedule-state":
+                WORKSPACE.set_schedule(int(body.get("id")), bool(body.get("enabled")))
+                self.send_json(200, {"ok": True})
+                return
+            if path == "/api/workspace/scope":
+                result = WORKSPACE.add_scope_rule(str(body.get("project", "")), str(body.get("pattern", "")), str(body.get("action", "allow")), str(body.get("authorizationRef", "")), str(body.get("expires", "")))
+                self.send_json(201, result)
+                return
+            if path == "/api/workspace/scope-state":
+                WORKSPACE.deactivate_scope(int(body.get("id")))
+                self.send_json(200, {"ok": True})
+                return
+            if path == "/api/enrichment/refresh":
+                if body.get("confirmExternal") is not True:
+                    raise ValidationError("External intelligence lookup must be explicitly confirmed")
+                start_intelligence_refresh()
+                self.send_json(202, dict(INTELLIGENCE_STATE))
                 return
             if path == "/api/stop":
                 job_id = body.get("id")
@@ -699,6 +901,7 @@ class Handler(SimpleHTTPRequestHandler):
                     self.send_json(404, {"error": "Job not found"})
                     return
                 JOBS.cancel(job)
+                WORKSPACE.audit("scan.cancelled", {"jobId": job.id, "project": job.project})
                 self.send_json(200, {"ok": True})
                 return
             if path == "/api/input":
@@ -718,6 +921,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             if path == "/api/shutdown":
                 self.server.shutdown_requested = True
+                WORKSPACE.audit("runner.shutdown", {})
                 self.send_json(200, {"ok": True})
                 def shutdown_runner() -> None:
                     for active_job in JOBS.active():
@@ -726,7 +930,7 @@ class Handler(SimpleHTTPRequestHandler):
                 threading.Thread(target=shutdown_runner, daemon=True).start()
                 return
             self.send_json(404, {"error": "Not found"})
-        except ValidationError as exc:
+        except (ValidationError, ValueError, TypeError) as exc:
             self.send_json(400, {"error": str(exc)})
         except Exception:
             LOGGER.exception("Unhandled request failure")
@@ -740,6 +944,7 @@ def create_server(port: int = DEFAULT_PORT) -> StudioServer:
 def main() -> None:
     no_browser = "--no-browser" in sys.argv
     server = create_server(DEFAULT_PORT)
+    SCHEDULER.start()
     url = f"http://127.0.0.1:{server.server_address[1]}"
     LOGGER.info("Nmap Studio %s starting at %s", VERSION, url)
     print(f"Nmap Studio {VERSION} is running at {url}")
@@ -750,6 +955,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        SCHEDULER.stop()
         for active_job in JOBS.active():
             JOBS.cancel(active_job)
         server.server_close()

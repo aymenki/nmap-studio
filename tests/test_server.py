@@ -19,6 +19,8 @@ import server  # noqa: E402
 class RunnerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.workspace_temp = tempfile.TemporaryDirectory(dir=ROOT)
+        server.WORKSPACE = server.Workspace(pathlib.Path(cls.workspace_temp.name) / "studio.db")
         fake = str(ROOT / "tests" / "fake_tool.py")
         for tool in server.TOOLS:
             server.COMMAND_OVERRIDES[tool] = [sys.executable, fake, tool]
@@ -35,6 +37,7 @@ class RunnerTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.httpd.server_close()
+        cls.workspace_temp.cleanup()
 
     @classmethod
     def request(cls, method, path, body=None, token=None, origin=True):
@@ -78,6 +81,52 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(job["code"], 0)
         self.assertIn("tool=nmap", job["output"])
         self.assertEqual(job["report"]["hosts"][0]["ports"][0]["service"], "http")
+
+    def test_workspace_scope_schedule_inventory_and_export_apis(self):
+        self.request(
+            "POST", "/api/workspace/scope",
+            {"project": "API workspace", "pattern": "127.0.0.1", "action": "allow", "authorizationRef": "TEST-1"},
+            self.token,
+        )
+        preview = self.request(
+            "POST", "/api/scope/preview",
+            {"tool": "nmap", "args": ["-sT", "127.0.0.1"], "safeMode": True, "project": "API workspace"},
+            self.token,
+        )
+        self.assertTrue(preview["allowed"])
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.request(
+                "POST", "/api/run",
+                {"tool": "nmap", "args": ["-sT", "192.0.2.1"], "safeMode": True, "project": "API workspace"},
+                self.token,
+            )
+        self.assertEqual(caught.exception.code, 400)
+        caught.exception.close()
+
+        created = self.request(
+            "POST", "/api/run",
+            {"tool": "nmap", "args": ["-sT", "127.0.0.1"], "safeMode": True, "project": "API workspace", "name": "Baseline"},
+            self.token,
+        )
+        self.wait_for_job(created["id"])
+        assets = self.request("GET", "/api/workspace/assets", token=self.token)
+        self.assertTrue(any(item["address"] == "127.0.0.1" for item in assets["assets"]))
+        schedule = self.request(
+            "POST", "/api/workspace/schedule",
+            {"tool": "nmap", "args": ["-sT", "127.0.0.1"], "project": "API workspace", "name": "Hourly", "intervalMinutes": 60},
+            self.token,
+        )
+        self.assertIsInstance(schedule["id"], int)
+        exported = self.request("GET", "/api/export?format=json", token=self.token)
+        self.assertIn("assets", exported)
+        audit = self.request("GET", "/api/workspace/audit", token=self.token)
+        self.assertTrue(audit["verification"]["valid"])
+
+    def test_intelligence_refresh_requires_explicit_external_confirmation(self):
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.request("POST", "/api/enrichment/refresh", {"confirmExternal": False}, self.token)
+        self.assertEqual(caught.exception.code, 400)
+        caught.exception.close()
 
     def test_advanced_mode_requires_explicit_confirmation(self):
         with self.assertRaises(urllib.error.HTTPError) as caught:
@@ -130,7 +179,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(store._jobs), server.MAX_COMPLETED_JOBS)
 
     def test_xml_allows_nmap_doctype_and_rejects_custom_doctypes(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
             path = pathlib.Path(directory) / "scan.xml"
             path.write_text(
                 '<?xml version="1.0"?><!DOCTYPE nmaprun><nmaprun>'

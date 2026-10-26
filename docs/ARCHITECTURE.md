@@ -12,24 +12,34 @@ Nmap Studio is deliberately local-first. The browser interface and Python runner
 4. The queue permits two running jobs and keeps additional jobs bounded.
 5. The runner launches the selected Nmap suite executable without a command shell.
 6. Output, progress, and parsed Nmap XML are retained in memory within fixed limits and returned to the local browser.
+7. Completed Nmap reports update the SQLite asset/service inventory, finding workflow, drift alerts, and audit chain.
 
 ## Trust boundaries
 
 - **Browser storage:** profiles and optional history stay in the browser. History is off by default.
 - **Loopback API:** the server binds to `127.0.0.1`, rejects untrusted Host and Origin values, requires a random session token for mutations, and emits a restrictive Content Security Policy.
 - **Process boundary:** arguments are passed as an array with `shell=False`. Process cancellation terminates the process tree where the operating system supports it.
-- **Filesystem:** reports and rotating diagnostics are local under `.nmap-studio/`; Git ignores that directory.
-- **Network:** Nmap traffic goes directly from the local process to targets selected by the operator. Nmap Studio has no hosted scan service.
+- **Filesystem:** reports, the SQLite workspace, and rotating diagnostics are local under `.nmap-studio/`; Git ignores that directory.
+- **Scheduler:** schedules run only while the local process is open. Every invocation is revalidated in Safe mode and against current scope rules.
+- **Network:** Nmap traffic goes directly from the local process to targets selected by the operator. Nmap Studio has no hosted scan service. Only an explicitly confirmed intelligence refresh contacts CISA, FIRST, and NVD.
 
 ## Main modules
 
 | Module | Responsibility |
 | --- | --- |
 | `server.py` | Local HTTP API, validation, job queue, process lifecycle, XML parsing, diagnostics |
+| `workspace.py` | SQLite inventory, drift, findings, schedules, scope, audit chain, and integration exports |
+| `intelligence.py` | Bounded, explicitly triggered CISA KEV, FIRST EPSS, and NVD enrichment |
 | `dist/app.js` | UI state, tool builders, scan manager, results dashboard, NSE library |
 | `dist/core.js` | Pure result filtering, comparison, and export functions |
 | `dist/catalog.js` | Human-readable tool and script descriptions |
-| `tests/` | API security, lifecycle, frontend policy, comparison, and export tests |
+| `tests/` | API security, lifecycle, workspace, audit, scope, comparison, and export tests |
+
+## Persistence and integrity
+
+SQLite uses foreign keys and WAL mode. Each API operation opens a short-lived connection and closes it explicitly. Audit entries include the previous entry hash; the governance screen recomputes the chain so direct modification is detectable. This is tamper-evident, not tamper-proof: a local administrator can replace the entire database.
+
+Service inventory represents the latest scan that touched an asset. Services not observed in a later scan remain available for history but are marked `not-seen`; drift alerts capture the change.
 
 ## Limits
 

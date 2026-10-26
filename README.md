@@ -9,6 +9,12 @@ Nmap Studio is a local browser interface for Nmap, Ncat, Nping, and Ndiff. It tu
 ## Highlights
 
 - Run all four Nmap suite tools inside the UI.
+- Build a persistent SQLite asset inventory with owners, criticality, tags, services, and first/last-seen timestamps.
+- Track findings through open, investigating, risk-accepted, false-positive, and resolved states.
+- Explicitly enrich findings with CISA KEV, FIRST EPSS, and possible NVD CVE matches.
+- Schedule Safe-mode rescans and review service/host drift alerts while the local runner is open.
+- Enforce project allow/deny scope rules and verify a hash-chained local audit trail.
+- Export workspace JSON, SARIF 2.1, Splunk/Elastic NDJSON, and DefectDojo-compatible CSV.
 - Organize named scans by project and follow queue position, stage, elapsed time, and progress.
 - Normalize website URLs to hostnames before scanning.
 - Stream output, send process input, cancel a process tree, and stop the runner.
@@ -39,6 +45,16 @@ The app opens at http://127.0.0.1:8765. Keep the terminal open and press Ctrl+C 
 
 Set NMAP_STUDIO_PORT before starting if port 8765 is already in use.
 
+## Security operations workflow
+
+Every completed Nmap scan is written to the local workspace at `.nmap-studio/studio.db`. Use **Asset inventory** to assign ownership, criticality, and tags. Scans with the same project and scan name form a baseline; **Monitoring** highlights new or missing hosts and new, removed, or changed services.
+
+Schedules are always revalidated in Safe mode and against active project scope rules. They execute only while Nmap Studio is running. Once a project has an active allow rule, all of its targets must match an allow rule; deny rules take precedence. Add an authorization or engagement reference so the reason for the scope is visible in the audit trail.
+
+NSE-reported CVE identifiers are stored as reported findings. An optional intelligence refresh also searches NVD using detected product/version fingerprints. These NVD results are intentionally labeled **possible** until a person confirms the exact affected product and version. Refreshing intelligence is the only feature that sends inventory-derived values outside the machine: it sends CVE identifiers to FIRST and product/version keywords to NVD, and downloads CISA's public KEV catalog. The UI requires confirmation first.
+
+Use **Integrations** for local exports. Tagged GitHub releases are rebuilt after tests, accompanied by SHA-256 checksums, and receive GitHub build-provenance attestations that can be verified with GitHub CLI.
+
 ## Execution modes
 
 Safe mode accepts common scan, discovery, timing, service, OS, connection, and probe options. It rejects listeners, output path overrides, higher-risk NSE categories, complex script arguments, and uncommon raw options.
@@ -53,7 +69,7 @@ Raw packet scans, OS detection, and some probe modes may need administrator or r
 
 The runner binds only to loopback. It validates Host and Origin, requires a random session token, sends no CORS headers, applies a strict Content Security Policy, limits requests and output, and retains at most 20 completed jobs for 24 hours in memory.
 
-Nmap Studio does not send scan data to a hosted service. Browser history persistence is disabled by default. Profiles and enabled history are stored in the browser. Reports and rotating diagnostic logs are stored under .nmap-studio/, which Git ignores.
+Nmap Studio has no hosted scan service and sends nothing externally during normal scanning. The optional, explicitly confirmed intelligence refresh contacts CISA, FIRST, and NVD as described above. Browser history persistence is disabled by default. Profiles and enabled history are stored in the browser. Inventory, findings, reports, audit entries, schedules, and rotating diagnostic logs are stored under `.nmap-studio/`, which Git ignores.
 
 Imported XML is limited to 10 MB, 2,000 hosts, and 50,000 ports. Automatic report parsing rejects XML document types.
 

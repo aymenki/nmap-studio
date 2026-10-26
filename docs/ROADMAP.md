@@ -2,6 +2,15 @@
 
 The roadmap favors reliable local operation and useful analysis over turning Nmap Studio into a remote scanning service.
 
+## Shipped in 0.4
+
+- Persistent asset/service inventory and security finding workflow
+- Explicit CISA KEV, FIRST EPSS, and possible NVD CVE enrichment
+- Scheduled Safe-mode rescans and drift alerts
+- Project scope rules, authorization references, and hash-chained audit events
+- SARIF, NDJSON, DefectDojo CSV, and workspace JSON exports
+- Reproducible archives, SHA-256 checksums, and GitHub provenance attestations
+
 ## Shipped in 0.3
 
 - Results search, filters, sorting, and JSON/CSV/HTML exports
@@ -13,12 +22,11 @@ The roadmap favors reliable local operation and useful analysis over turning Nma
 
 ## Next
 
-- Saved project workspaces and persistent, encrypted-at-rest report storage
+- Optional encrypted-at-rest workspace storage and configurable retention
 - Better progress estimation using Nmap XML progress events
-- Findings notes, tags, and explicit owner/authorization records
 - Report redaction before export
 - Accessibility and keyboard-navigation audit
-- Signed release archives and automated release provenance
+- Native ticket/webhook connectors with explicit per-destination configuration
 
 ## Later
 

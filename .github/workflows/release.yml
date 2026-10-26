@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  verify-build-attest-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Verify backend and frontend
+        run: |
+          python -m unittest discover -s tests -v
+          python -m py_compile server.py launch.py workspace.py intelligence.py
+          node --check dist/app.js
+          node --check dist/core.js
+          node tests/test_core.js
+      - name: Build reproducible archive
+        run: python scripts/build_release.py
+      - name: Attest archive provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: "release/*.zip"
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          release/*.zip release/*.sha256
+          --verify-tag --generate-notes
+          --title "Nmap Studio $GITHUB_REF_NAME"
